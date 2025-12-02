@@ -14,7 +14,7 @@ const CONFIG = {
   },
   
   backend: {
-    url: 'https://rebit-api.ceewen.xyz',
+    url: 'https://app.rebit-japan.com/',
     timeout: 8000
   },
   
@@ -25,10 +25,10 @@ const CONFIG = {
   },
   
   mqtt: {
-    brokerUrl: 'mqtts://mqtt.ceewen.xyz:8883',
-    username: 'mqttuser',
-    password: 'mqttUser@2025',
-    caFile: 'C:\\Users\\YY\\rebit-mqtt\\certs\\star.ceewen.xyz.ca-bundle',
+    brokerUrl: 'mqtts://app.rebit-japan.com:8883',
+    username: 'mqttproduser',
+    password: '2o25@pR0Du$3rW8tl',
+    caFile: 'C:\\Users\\YY\\RebitMqtt\\certs/app.rebit-japan.com.ca-bundle',
     topics: {
       commands: 'rvm/RVM-3101/commands',
       autoControl: 'rvm/RVM-3101/control/auto',
@@ -39,8 +39,7 @@ const CONFIG = {
       qrScan: 'rvm/RVM-3101/qr/scanned',
       screenState: 'rvm/RVM-3101/screen/state',
       qrInput: 'rvm/RVM-3101/qr/input',
-      guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status'
+      guestStart: 'rvm/RVM-3101/guest/start'
     }
   },
   

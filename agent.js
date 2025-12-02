@@ -28,7 +28,7 @@ const CONFIG = {
     brokerUrl: 'mqtts://app.rebit-japan.com:8883',
     username: 'mqttproduser',
     password: '2o25@pR0Du$3rW8tl',
-    caFile: 'C:\\Users\\YY\\REBITMQTT\\certs/app.rebit-japan.com.ca-bundle',
+    caFile: 'C:\\Users\\YY\\RebitMqtt\\certs/app.rebit-japan.com.ca-bundle',
     topics: {
       commands: 'rvm/RVM-3101/commands',
       autoControl: 'rvm/RVM-3101/control/auto',

@@ -848,7 +848,11 @@ async function startCompactor() {
   if (state.compactorRunning) {
     log('⚠️ Compactor already running - stopping for new cycle', 'warning');
     
-    await executeCommand('customMotor', CONFIG.motors.compactor.stop);
+    try {
+      await executeCommand('customMotor', CONFIG.motors.compactor.stop);
+    } catch (error) {
+      log(`Error stopping old compactor: ${error.message}`, 'error');
+    }
     
     if (state.compactorTimer) {
       clearTimeout(state.compactorTimer);
@@ -861,24 +865,42 @@ async function startCompactor() {
     await delay(500);
   }
   
-  // Start fresh compactor cycle
-  state.compactorRunning = true;
   log('🔨 Starting compactor (22s background)', 'info');
   
-  await executeCommand('customMotor', CONFIG.motors.compactor.start);
-  
-  // Auto-stop after 22 seconds
-  state.compactorTimer = setTimeout(async () => {
-    try {
-      await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-      log('✅ Compactor cycle complete', 'success');
-    } catch (error) {
-      log(`Compactor stop error: ${error.message}`, 'error');
+  try {
+    // Start the motor FIRST
+    await executeCommand('customMotor', CONFIG.motors.compactor.start);
+    
+    // Only set running flag AFTER successful start
+    state.compactorRunning = true;
+    
+    // Auto-stop after 22 seconds
+    state.compactorTimer = setTimeout(async () => {
+      try {
+        await executeCommand('customMotor', CONFIG.motors.compactor.stop);
+        log('✅ Compactor cycle complete', 'success');
+      } catch (error) {
+        log(`Compactor stop error: ${error.message}`, 'error');
+      }
+      
+      state.compactorRunning = false;
+      state.compactorTimer = null;
+    }, CONFIG.timing.compactor);
+    
+    log('✅ Compactor started successfully', 'success');
+    
+  } catch (error) {
+    // If start fails, make sure state is clean
+    log(`❌ Failed to start compactor: ${error.message}`, 'error');
+    state.compactorRunning = false;
+    
+    if (state.compactorTimer) {
+      clearTimeout(state.compactorTimer);
+      state.compactorTimer = null;
     }
     
-    state.compactorRunning = false;
-    state.compactorTimer = null;
-  }, CONFIG.timing.compactor);
+    throw error; // Re-throw so caller knows it failed
+  }
 }
 
 async function executeRejectionCycle() {

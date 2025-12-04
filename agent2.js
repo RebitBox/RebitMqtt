@@ -90,7 +90,7 @@ const CONFIG = {
     compactorIdleStop: 8000,   // 🔨 Stop if no items for 8s
     positionSettle: 300,
     gateOperation: 800,
-    autoPhotoDelay: 2000,      // ⚡ Optimized
+    autoPhotoDelay: 2500,      // ⚡ Optimized (increased to avoid false detections)
     sessionTimeout: 120000,
     sessionMaxDuration: 600000,
     weightDelay: 1200,         // ⚡ Optimized
@@ -934,6 +934,8 @@ async function executeRejectionCycle() {
     await executeCommand('customMotor', CONFIG.motors.belt.reverse);
     await delay(CONFIG.timing.beltReverse);
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    
+    log('✅ Item rejected', 'crusher');
 
     mqttClient.publish('rvm/RVM-3101/item/rejected', JSON.stringify({
       deviceId: CONFIG.device.id,
@@ -1483,7 +1485,10 @@ function connectWebSocket() {
           if (state.aiResult.materialType !== 'UNKNOWN') {
             state.detectionRetries = 0;
             state.awaitingDetection = false;
+            
+            // Get weight to confirm item is present
             setTimeout(() => executeCommand('getWeight'), 300);
+            
           } else {
             state.detectionRetries++;
             
@@ -1494,9 +1499,49 @@ function connectWebSocket() {
                 }
               }, CONFIG.detection.retryDelay);
             } else {
+              // BEFORE REJECTING: Check if there's actually an item
+              // Take weight measurement to confirm
               state.awaitingDetection = false;
-              state.cycleInProgress = true;
-              setTimeout(() => executeRejectionCycle(), 1000);
+              
+              setTimeout(async () => {
+                try {
+                  await executeCommand('getWeight');
+                  
+                  // Weight measurement will come via WebSocket
+                  // Wait a bit for the weight response
+                  await delay(CONFIG.timing.weightDelay + 500);
+                  
+                  // Check if we got a valid weight
+                  if (state.weight && state.weight.weight >= CONFIG.detection.minValidWeight) {
+                    // There IS an item, reject it
+                    state.cycleInProgress = true;
+                    setTimeout(() => executeRejectionCycle(), 500);
+                  } else {
+                    // No item detected - just clear and wait for next
+                    log('No item detected - skipping rejection', 'crusher');
+                    state.aiResult = null;
+                    state.weight = null;
+                    state.detectionRetries = 0;
+                    
+                    // Continue waiting for real item
+                    if (state.autoCycleEnabled) {
+                      state.autoPhotoTimer = setTimeout(() => {
+                        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+                          state.awaitingDetection = true;
+                          executeCommand('takePhoto');
+                        }
+                      }, CONFIG.timing.autoPhotoDelay);
+                    }
+                  }
+                } catch (error) {
+                  log(`Weight check error: ${error.message}`, 'error');
+                  // If weight check fails, assume no item
+                  state.aiResult = null;
+                  state.weight = null;
+                  state.detectionRetries = 0;
+                  state.awaitingDetection = false;
+                }
+              }, 300);
             }
           }
         }

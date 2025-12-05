@@ -8,7 +8,7 @@ const { GlobalKeyboardListener } = require('node-global-key-listener');
 
 // ============================================
 // CONFIGURATION - EVENT DRIVEN
-// ============================================
+// ============================================f
 const CONFIG = {
   device: {
     id: 'RVM-3101'
@@ -41,8 +41,7 @@ const CONFIG = {
       screenState: 'rvm/RVM-3101/screen/state',
       qrInput: 'rvm/RVM-3101/qr/input',
       guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status',
-      deviceOnline: 'rvm/RVM-3101/online'  // ✅ NEW: Explicit online status
+      binStatus: 'rvm/RVM-3101/bin/status'
     }
   },
   
@@ -110,8 +109,7 @@ const CONFIG = {
   heartbeat: {
     interval: 30,
     maxModuleIdRetries: 10,
-    stateCheckInterval: 30,
-    onlineStatusInterval: 15  // ✅ NEW: Send online status every 15s
+    stateCheckInterval: 30
   },
   
   weight: {
@@ -233,33 +231,6 @@ function setHardwareTimeout(callback, operation) {
     log(`Hardware timeout: ${operation}`, 'warning');
     callback();
   }, CONFIG.timing.hardwareResponseTimeout);
-}
-
-// ✅ NEW: Publish device online status
-function publishOnlineStatus(isOnline = true) {
-  if (!mqttClient || !mqttClient.connected) return;
-  
-  const status = isOnline ? 'online' : 'offline';
-  
-  // Publish to both topics for redundancy
-  mqttClient.publish(CONFIG.mqtt.topics.deviceOnline, JSON.stringify({
-    deviceId: CONFIG.device.id,
-    status: status,
-    isReady: state.isReady,
-    timestamp: new Date().toISOString()
-  }), { retain: true, qos: 1 });
-  
-  mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
-    deviceId: CONFIG.device.id,
-    status: status,
-    event: isOnline ? 'device_online' : 'device_offline',
-    isReady: state.isReady,
-    moduleId: state.moduleId,
-    eventDrivenMode: true,
-    timestamp: new Date().toISOString()
-  }), { retain: true, qos: 1 });
-  
-  console.log(`📡 Device status: ${status.toUpperCase()}`);
 }
 
 // ============================================
@@ -553,7 +524,6 @@ function checkScannerHealth() {
 const heartbeat = {
   interval: null,
   stateCheckInterval: null,
-  onlineStatusInterval: null,  // ✅ NEW
   timeout: CONFIG.heartbeat.interval,
   moduleIdRetries: 0,
   maxModuleIdRetries: CONFIG.heartbeat.maxModuleIdRetries,
@@ -574,15 +544,6 @@ const heartbeat = {
     this.stateCheckInterval = setInterval(() => {
       checkScannerHealth();
     }, CONFIG.heartbeat.stateCheckInterval * 1000);
-    
-    // ✅ NEW: Send online status more frequently
-    if (this.onlineStatusInterval) {
-      clearInterval(this.onlineStatusInterval);
-    }
-    
-    this.onlineStatusInterval = setInterval(() => {
-      publishOnlineStatus(true);
-    }, CONFIG.heartbeat.onlineStatusInterval * 1000);
   },
   
   stop() {
@@ -594,11 +555,6 @@ const heartbeat = {
     if (this.stateCheckInterval) {
       clearInterval(this.stateCheckInterval);
       this.stateCheckInterval = null;
-    }
-    
-    if (this.onlineStatusInterval) {
-      clearInterval(this.onlineStatusInterval);
-      this.onlineStatusInterval = null;
     }
   },
   
@@ -620,9 +576,6 @@ const heartbeat = {
           console.log('🟢 SYSTEM READY - EVENT DRIVEN MODE');
           
           setupQRScanner();
-          
-          // ✅ Publish online status immediately when ready
-          publishOnlineStatus(true);
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -1260,9 +1213,6 @@ async function resetSystemForNextUser(forceStop = false) {
     
     console.log('✅ READY');
     
-    // ✅ Ensure online status is published after reset
-    publishOnlineStatus(true);
-    
     mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
       deviceId: CONFIG.device.id,
       status: 'ready',
@@ -1399,9 +1349,6 @@ function connectWebSocket() {
           console.log('🟢 SYSTEM READY - EVENT DRIVEN');
           
           setupQRScanner();
-          
-          // ✅ Publish online status
-          publishOnlineStatus(true);
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -1614,8 +1561,20 @@ mqttClient.on('connect', () => {
   mqttClient.subscribe(CONFIG.mqtt.topics.qrInput);
   mqttClient.subscribe(CONFIG.mqtt.topics.guestStart);
   
-  // ✅ Immediately publish online status with retain
-  publishOnlineStatus(true);
+  mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
+    deviceId: CONFIG.device.id,
+    status: 'online',
+    event: 'device_connected',
+    timestamp: new Date().toISOString()
+  }), { retain: true });
+  
+  mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
+    deviceId: CONFIG.device.id,
+    status: 'ready',
+    event: 'startup_ready',
+    isReady: true,
+    timestamp: new Date().toISOString()
+  }));
   
   connectWebSocket();
   
@@ -1757,8 +1716,11 @@ mqttClient.on('reconnect', () => {
 function gracefulShutdown() {
   console.log('\n⏹️ Shutting down event-driven agent...\n');
   
-  // ✅ Publish offline status before shutdown
-  publishOnlineStatus(false);
+  mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
+    deviceId: CONFIG.device.id,
+    status: 'offline',
+    timestamp: new Date().toISOString()
+  }), { retain: true });
   
   clearQRProcessing();
   clearHardwareTimeout();
@@ -1810,5 +1772,4 @@ console.log('='.repeat(60));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Hardware limit switches (type 03)');
 console.log('Expected: <10s per bottle with parallel operations');
-console.log('✅ Enhanced device status reporting');
 console.log('='.repeat(60) + '\n');

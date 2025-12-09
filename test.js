@@ -1,4 +1,4 @@
-// agent-qr-ultra-fast-optimized.js - OPTIMIZED WITH MANUFACTURER TIMINGS + 10% SAFETY MARGIN
+// agent-qr-ultra-reliable-optimized.js - FIXED VERSION WITH QR RECOVERY
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -6,7 +6,7 @@ const WebSocket = require('ws');
 const { GlobalKeyboardListener } = require('node-global-key-listener');
 
 // ============================================
-// CONFIGURATION - OPTIMIZED TIMINGS
+// CONFIGURATION
 // ============================================
 const CONFIG = {
   device: {
@@ -39,7 +39,8 @@ const CONFIG = {
       qrScan: 'rvm/RVM-3101/qr/scanned',
       screenState: 'rvm/RVM-3101/screen/state',
       qrInput: 'rvm/RVM-3101/qr/input',
-      guestStart: 'rvm/RVM-3101/guest/start'
+      guestStart: 'rvm/RVM-3101/guest/start',
+      binStatus: 'rvm/RVM-3101/bin/status'
     }
   },
   
@@ -49,7 +50,9 @@ const CONFIG = {
     maxLength: 50,
     scanTimeout: 200,
     processingTimeout: 25000,
-    debug: true
+    debug: true,
+    restartAfterSession: true,  // 🆕 Always restart after session
+    healthCheckInterval: 15000   // 🆕 Check every 15s
   },
   
   motors: {
@@ -64,48 +67,40 @@ const CONFIG = {
       stop: { motorId: "04", type: "00" }
     },
     stepper: {
-      moduleId: null,  // Will be set dynamically from main module ID
+      moduleId: '09',
       positions: { home: '01', metalCan: '02', plasticBottle: '03' }
     }
   },
   
   detection: {
-    METAL_CAN: 0.20,        // Slightly lower for faster acceptance
-    PLASTIC_BOTTLE: 0.27,   // Slightly lower
-    GLASS: 0.22,            // Slightly lower
-    retryDelay: 1100,       // Reduced with 10% margin (1000ms * 1.1)
+    METAL_CAN: 0.22,
+    PLASTIC_BOTTLE: 0.30,
+    GLASS: 0.25,
+    retryDelay: 1500,
     maxRetries: 2,
     hasObjectSensor: false,
-    minValidWeight: 4       // Slightly lower threshold
+    minValidWeight: 5
   },
   
   timing: {
-    // OPTIMIZED TIMINGS based on manufacturer specs + 10% safety margin
-    // Manufacturer: Belt ~40mm movement = fast
-    beltToWeight: 1650,        // 1500ms * 1.1 (was 2500ms) - SAVED 850ms
-    beltToStepper: 1980,       // 1800ms * 1.1 (was 3500ms) - SAVED 1520ms
-    beltReverse: 2200,         // 2000ms * 1.1 (was 4000ms) - SAVED 1800ms
-    
-    // Manufacturer: Roller rotation 400-500ms = VERY fast!
-    stepperRotate: 880,        // 800ms * 1.1 (was 3500ms) - SAVED 2620ms! 🚀
-    stepperReset: 1320,        // 1200ms * 1.1 (was 5000ms) - SAVED 3680ms! 🚀
-    
-    // Compactor runs in background
-    compactor: 22000,          // Keep same
-    
-    // Other optimized timings
-    positionSettle: 220,       // 200ms * 1.1 (was 300ms)
-    gateOperation: 1100,       // 1000ms * 1.1 (was 800ms) - manufacturer says ~1s
-    autoPhotoDelay: 1650,      // 1500ms * 1.1 (was 3000ms) - SAVED 1350ms
+    beltToWeight: 2500,
+    beltToStepper: 2800,
+    beltReverse: 4000,
+    stepperRotate: 2500,
+    stepperReset: 3500,
+    compactorCycle: 22000,
+    compactorIdleStop: 8000,
+    positionSettle: 300,
+    gateOperation: 800,
+    autoPhotoDelay: 2500,
     sessionTimeout: 120000,
     sessionMaxDuration: 600000,
-    
-    // Detection timings
-    weightDelay: 550,          // 500ms * 1.1 (was 1500ms) - SAVED 950ms
-    photoDelay: 880,           // 800ms * 1.1 (was 1200ms)
-    calibrationDelay: 880,     // 800ms * 1.1 (was 1200ms)
-    commandDelay: 110,         // 100ms * 1.1
-    resetHomeDelay: 880        // 800ms * 1.1 (was 1500ms)
+    weightDelay: 1200,
+    photoDelay: 1000,
+    calibrationDelay: 1000,
+    commandDelay: 100,
+    resetHomeDelay: 1200,
+    itemDropDelay: 800
   },
   
   heartbeat: {
@@ -141,6 +136,8 @@ const state = {
   globalKeyListener: null,
   lastSuccessfulScan: null,
   lastKeyboardActivity: Date.now(),
+  scannerHealthTimer: null,  // 🆕 Health check timer
+  lastScannerRestart: Date.now(),  // 🆕 Track last restart
   
   // Session tracking
   sessionId: null,
@@ -155,9 +152,12 @@ const state = {
   sessionTimeoutTimer: null,
   maxDurationTimer: null,
   
-  // Hardware state
+  // Continuous compactor state
   compactorRunning: false,
   compactorTimer: null,
+  compactorIdleTimer: null,
+  lastItemTime: null,
+  
   autoPhotoTimer: null,
   detectionRetries: 0,
   awaitingDetection: false,
@@ -165,17 +165,16 @@ const state = {
   
   // Bin status tracking
   binStatus: {
-    plastic: false,    // Bin 0 - Left (PET bottles)
-    metal: false,      // Bin 1 - Middle (Metal cans)
-    right: false,      // Bin 2 - Right (unused)
-    glass: false       // Bin 3 - Glass (unused)
+    plastic: false,
+    metal: false,
+    right: false,
+    glass: false
   },
   
   // Performance tracking
   lastCycleTime: null,
   averageCycleTime: null,
-  cycleCount: 0,
-  totalTimeSaved: 0
+  cycleCount: 0
 };
 
 // ============================================
@@ -184,20 +183,25 @@ const state = {
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(message, level = 'info') {
-  // Only log errors, warnings, and critical success messages
-  if (level === 'error' || level === 'warning' || level === 'critical') {
-    const timestamp = new Date().toISOString();
-    const prefix = {
-      'error': '❌',
-      'warning': '⚠️',
-      'critical': '✅'
-    }[level] || 'ℹ️';
-    console.log(`[${timestamp}] ${prefix} ${message}`);
-  }
+  const timestamp = new Date().toISOString();
+  const prefix = {
+    'info': 'ℹ️',
+    'success': '✅',
+    'error': '❌',
+    'warning': '⚠️',
+    'debug': '🔍',
+    'perf': '⚡',
+    'qr': '📱',
+    'crusher': '🔨'
+  }[level] || 'ℹ️';
+  
+  console.log(`[${timestamp}] ${prefix} ${message}`);
 }
 
 function debugLog(message) {
-  // Disabled - minimal logging
+  if (CONFIG.qr.debug) {
+    log(message, 'debug');
+  }
 }
 
 function trackCycleTime(startTime) {
@@ -211,21 +215,24 @@ function trackCycleTime(startTime) {
     state.averageCycleTime = (state.averageCycleTime * (state.cycleCount - 1) + cycleTime) / state.cycleCount;
   }
   
-  // Only log every 10th cycle
-  if (state.cycleCount % 10 === 0) {
-    console.log(`⚡ Cycle #${state.cycleCount}: ${(cycleTime / 1000).toFixed(1)}s | Avg: ${(state.averageCycleTime / 1000).toFixed(1)}s`);
-  }
+  log(`⚡ Cycle completed in ${(cycleTime / 1000).toFixed(1)}s | Avg: ${(state.averageCycleTime / 1000).toFixed(1)}s`, 'perf');
 }
 
 // ============================================
-// QR SCANNER - ULTRA SIMPLE & RELIABLE
+// QR SCANNER - FIXED VERSION
 // ============================================
 
 function canAcceptQRScan() {
-  return state.isReady && 
-         !state.autoCycleEnabled && 
-         !state.processingQR && 
-         !state.resetting;
+  const canScan = state.isReady && 
+                  !state.autoCycleEnabled && 
+                  !state.processingQR && 
+                  !state.resetting;
+  
+  if (!canScan) {
+    debugLog(`Cannot scan - Ready:${state.isReady} Cycle:${state.autoCycleEnabled} Proc:${state.processingQR} Reset:${state.resetting}`);
+  }
+  
+  return canScan;
 }
 
 function clearQRProcessing() {
@@ -241,6 +248,66 @@ function clearQRProcessing() {
   
   state.processingQR = false;
   state.qrBuffer = '';
+  
+  debugLog('✅ QR processing state cleared');
+}
+
+// 🆕 FIXED: Force restart keyboard listener
+function forceRestartScanner() {
+  log('🔄 Force restarting QR scanner...', 'warning');
+  
+  // Clear all QR state
+  clearQRProcessing();
+  
+  // Kill existing listener
+  if (state.globalKeyListener) {
+    try {
+      state.globalKeyListener.kill();
+    } catch (e) {
+      log(`Error killing listener: ${e.message}`, 'error');
+    }
+    state.globalKeyListener = null;
+  }
+  
+  // Wait a moment then recreate
+  setTimeout(() => {
+    log('✅ Creating fresh QR scanner...', 'success');
+    setupQRScanner();
+  }, 1000);
+}
+
+// 🆕 Check if scanner is actually responsive
+function testScannerHealth() {
+  if (!state.globalKeyListener) {
+    return false;
+  }
+  
+  const timeSinceActivity = Date.now() - state.lastKeyboardActivity;
+  const timeSinceRestart = Date.now() - state.lastScannerRestart;
+  
+  // If no activity for 3 minutes AND it's been 30+ seconds since restart, it might be dead
+  if (timeSinceActivity > 180000 && timeSinceRestart > 30000 && !state.autoCycleEnabled) {
+    log('⚠️ Scanner appears unresponsive - no activity for 3+ min', 'warning');
+    return false;
+  }
+  
+  return true;
+}
+
+// 🆕 Periodic scanner health check
+function startScannerHealthMonitor() {
+  if (state.scannerHealthTimer) {
+    clearInterval(state.scannerHealthTimer);
+  }
+  
+  state.scannerHealthTimer = setInterval(() => {
+    if (!testScannerHealth() && canAcceptQRScan()) {
+      log('💊 Auto-healing QR scanner...', 'warning');
+      forceRestartScanner();
+    }
+  }, CONFIG.qr.healthCheckInterval);
+  
+  log(`💊 Scanner health monitor started (${CONFIG.qr.healthCheckInterval}ms)`, 'info');
 }
 
 async function validateQRWithBackend(sessionCode) {
@@ -255,6 +322,7 @@ async function validateQRWithBackend(sessionCode) {
     );
     
     if (response.data.success) {
+      log(`✅ QR validated - User: ${response.data.user.name}`, 'success');
       return {
         valid: true,
         user: response.data.user,
@@ -268,7 +336,7 @@ async function validateQRWithBackend(sessionCode) {
     }
     
   } catch (error) {
-    log(`QR validation error: ${error.message}`, 'error');
+    log(`❌ QR validation error: ${error.message}`, 'error');
     return {
       valid: false,
       error: error.response?.data?.error || 'Network error'
@@ -278,6 +346,7 @@ async function validateQRWithBackend(sessionCode) {
 
 async function processQRCode(qrData) {
   if (!canAcceptQRScan()) {
+    debugLog('QR rejected - system not ready for scan');
     return;
   }
   
@@ -290,11 +359,13 @@ async function processQRCode(qrData) {
   
   state.processingQR = true;
   state.processingQRTimeout = setTimeout(() => {
-    log('QR timeout', 'warning');
+    log('⏰ QR processing timeout!', 'warning');
     clearQRProcessing();
   }, CONFIG.qr.processingTimeout);
   
-  console.log(`📱 QR: ${cleanCode}`);
+  log(`\n${'='.repeat(50)}`, 'qr');
+  log(`📱 QR CODE: ${cleanCode}`, 'qr');
+  log(`${'='.repeat(50)}\n`, 'qr');
   
   try {
     mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
@@ -318,9 +389,7 @@ async function processQRCode(qrData) {
       }));
       
       await delay(1500);
-      
       clearQRProcessing();
-      
       await startMemberSession(validation);
       
     } else {
@@ -344,7 +413,7 @@ async function processQRCode(qrData) {
     }
     
   } catch (error) {
-    log(`QR error: ${error.message}`, 'error');
+    log(`❌ QR error: ${error.message}`, 'error');
     
     mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
       deviceId: CONFIG.device.id,
@@ -354,23 +423,19 @@ async function processQRCode(qrData) {
     }));
     
     await delay(2500);
-    
     clearQRProcessing();
     
   } finally {
     clearQRProcessing();
+    log('✅ QR processing complete', 'qr');
   }
 }
 
-function setupQRScanner() {
-  if (!CONFIG.qr.enabled) {
-    log('QR scanner disabled', 'warning');
-    return;
-  }
-  
-  if (state.globalKeyListener) {
-    return;
-  }
+// 🆕 FIXED: Separate function to create listener
+function createKeyboardListener() {
+  console.log('\n' + '='.repeat(50));
+  console.log('📱 QR SCANNER - CREATING NEW LISTENER');
+  console.log('='.repeat(50) + '\n');
   
   const CONSOLE_PATTERNS = [
     /^C:\\/i,
@@ -387,69 +452,21 @@ function setupQRScanner() {
     return CONSOLE_PATTERNS.some(pattern => pattern.test(text));
   }
   
-  const gkl = new GlobalKeyboardListener();
-  
-  gkl.addListener((e, down) => {
-    if (e.state !== 'DOWN') return;
+  try {
+    const gkl = new GlobalKeyboardListener();
     
-    state.lastKeyboardActivity = Date.now();
-    
-    if (!canAcceptQRScan()) {
-      return;
-    }
-    
-    const currentTime = Date.now();
-    
-    if (e.name === 'RETURN' || e.name === 'ENTER') {
-      if (state.qrBuffer.length >= CONFIG.qr.minLength && 
-          state.qrBuffer.length <= CONFIG.qr.maxLength &&
-          !isConsoleOutput(state.qrBuffer)) {
-        
-        const qrCode = state.qrBuffer;
-        state.qrBuffer = '';
-        
-        if (state.qrTimer) {
-          clearTimeout(state.qrTimer);
-          state.qrTimer = null;
-        }
-        
-        processQRCode(qrCode).catch(error => {
-          log(`QR error: ${error.message}`, 'error');
-          clearQRProcessing();
-        });
-        
-      } else {
-        state.qrBuffer = '';
-      }
-      return;
-    }
-    
-    const char = e.name;
-    
-    if (char.length === 1) {
-      const timeDiff = currentTime - state.lastCharTime;
+    gkl.addListener((e, down) => {
+      if (e.state !== 'DOWN') return;
       
-      if (timeDiff > CONFIG.qr.scanTimeout && state.qrBuffer.length > 0) {
-        state.qrBuffer = '';
-      }
+      state.lastKeyboardActivity = Date.now();
       
-      if (state.qrBuffer.length >= CONFIG.qr.maxLength) {
-        state.qrBuffer = '';
-        if (state.qrTimer) {
-          clearTimeout(state.qrTimer);
-          state.qrTimer = null;
-        }
+      if (!canAcceptQRScan()) {
         return;
       }
       
-      state.qrBuffer += char;
-      state.lastCharTime = currentTime;
+      const currentTime = Date.now();
       
-      if (state.qrTimer) {
-        clearTimeout(state.qrTimer);
-      }
-      
-      state.qrTimer = setTimeout(() => {
+      if (e.name === 'RETURN' || e.name === 'ENTER') {
         if (state.qrBuffer.length >= CONFIG.qr.minLength && 
             state.qrBuffer.length <= CONFIG.qr.maxLength &&
             !isConsoleOutput(state.qrBuffer)) {
@@ -457,20 +474,187 @@ function setupQRScanner() {
           const qrCode = state.qrBuffer;
           state.qrBuffer = '';
           
+          if (state.qrTimer) {
+            clearTimeout(state.qrTimer);
+            state.qrTimer = null;
+          }
+          
+          log(`✅ QR detected (ENTER): ${qrCode}`, 'success');
+          
           processQRCode(qrCode).catch(error => {
-            log(`QR error: ${error.message}`, 'error');
+            log(`QR async error: ${error.message}`, 'error');
             clearQRProcessing();
           });
           
         } else {
           state.qrBuffer = '';
         }
-        state.qrTimer = null;
-      }, CONFIG.qr.scanTimeout);
-    }
-  });
+        return;
+      }
+      
+      const char = e.name;
+      
+      if (char.length === 1) {
+        const timeDiff = currentTime - state.lastCharTime;
+        
+        if (timeDiff > CONFIG.qr.scanTimeout && state.qrBuffer.length > 0) {
+          state.qrBuffer = '';
+        }
+        
+        if (state.qrBuffer.length >= CONFIG.qr.maxLength) {
+          state.qrBuffer = '';
+          if (state.qrTimer) {
+            clearTimeout(state.qrTimer);
+            state.qrTimer = null;
+          }
+          return;
+        }
+        
+        state.qrBuffer += char;
+        state.lastCharTime = currentTime;
+        debugLog(`Buffer: "${state.qrBuffer}"`);
+        
+        if (state.qrTimer) {
+          clearTimeout(state.qrTimer);
+        }
+        
+        state.qrTimer = setTimeout(() => {
+          if (state.qrBuffer.length >= CONFIG.qr.minLength && 
+              state.qrBuffer.length <= CONFIG.qr.maxLength &&
+              !isConsoleOutput(state.qrBuffer)) {
+            
+            const qrCode = state.qrBuffer;
+            state.qrBuffer = '';
+            log(`✅ QR auto-detected: ${qrCode}`, 'success');
+            
+            processQRCode(qrCode).catch(error => {
+              log(`QR async error: ${error.message}`, 'error');
+              clearQRProcessing();
+            });
+            
+          } else {
+            state.qrBuffer = '';
+          }
+          state.qrTimer = null;
+        }, CONFIG.qr.scanTimeout);
+      }
+    });
+    
+    state.globalKeyListener = gkl;
+    state.lastScannerRestart = Date.now();
+    state.lastKeyboardActivity = Date.now();
+    
+    log('✅ Keyboard listener created successfully!', 'success');
+    
+  } catch (error) {
+    log(`❌ Failed to create keyboard listener: ${error.message}`, 'error');
+    state.globalKeyListener = null;
+  }
+}
+
+// 🆕 FIXED: Main setup function with proper restart logic
+function setupQRScanner() {
+  if (!CONFIG.qr.enabled) {
+    log('QR scanner disabled', 'warning');
+    return;
+  }
   
-  state.globalKeyListener = gkl;
+  // Always kill existing listener first
+  if (state.globalKeyListener) {
+    try {
+      log('🔄 Stopping existing keyboard listener...', 'warning');
+      state.globalKeyListener.kill();
+      state.globalKeyListener = null;
+    } catch (e) {
+      log(`Error killing listener: ${e.message}`, 'error');
+      state.globalKeyListener = null;
+    }
+    
+    // Wait for cleanup
+    setTimeout(() => {
+      createKeyboardListener();
+    }, 800);
+    return;
+  }
+  
+  // Create new listener
+  createKeyboardListener();
+}
+
+// ============================================
+// CONTINUOUS COMPACTOR MANAGEMENT
+// ============================================
+
+async function startContinuousCompactor() {
+  if (state.compactorIdleTimer) {
+    clearTimeout(state.compactorIdleTimer);
+    state.compactorIdleTimer = null;
+  }
+  
+  if (state.compactorRunning) {
+    log('🔨 Compactor already running - continuing', 'crusher');
+    resetCompactorIdleTimer();
+    return;
+  }
+  
+  log('🔨 Starting continuous compactor', 'crusher');
+  
+  try {
+    await executeCommand('customMotor', CONFIG.motors.compactor.start);
+    state.compactorRunning = true;
+    state.lastItemTime = Date.now();
+    
+    log('✅ Compactor started - will run until idle', 'crusher');
+    
+    resetCompactorIdleTimer();
+    
+  } catch (error) {
+    log(`❌ Failed to start compactor: ${error.message}`, 'error');
+    state.compactorRunning = false;
+    throw error;
+  }
+}
+
+function resetCompactorIdleTimer() {
+  if (state.compactorIdleTimer) {
+    clearTimeout(state.compactorIdleTimer);
+  }
+  
+  state.lastItemTime = Date.now();
+  
+  state.compactorIdleTimer = setTimeout(async () => {
+    if (state.compactorRunning && state.autoCycleEnabled) {
+      log('🔨 No items detected - stopping compactor (idle)', 'crusher');
+      await stopCompactor();
+    }
+  }, CONFIG.timing.compactorIdleStop);
+  
+  debugLog(`🔨 Compactor idle timer reset (${CONFIG.timing.compactorIdleStop}ms)`);
+}
+
+async function stopCompactor() {
+  if (!state.compactorRunning) {
+    return;
+  }
+  
+  try {
+    await executeCommand('customMotor', CONFIG.motors.compactor.stop);
+    log('✅ Compactor stopped', 'crusher');
+  } catch (error) {
+    log(`Compactor stop error: ${error.message}`, 'error');
+  }
+  
+  state.compactorRunning = false;
+  
+  if (state.compactorTimer) {
+    clearTimeout(state.compactorTimer);
+    state.compactorTimer = null;
+  }
+  
+  if (state.compactorIdleTimer) {
+    clearTimeout(state.compactorIdleTimer);
+    state.compactorIdleTimer = null;
+  }
 }
 
 // ============================================
@@ -480,33 +664,31 @@ function setupQRScanner() {
 function checkScannerHealth() {
   const now = Date.now();
   const timeSinceActivity = now - state.lastKeyboardActivity;
+  const timeSinceRestart = now - state.lastScannerRestart;
   
-  // Only log issues
+  log('🏥 Scanner Health:', 'qr');
+  log(`   isReady: ${state.isReady}`, 'qr');
+  log(`   autoCycle: ${state.autoCycleEnabled}`, 'qr');
+  log(`   processingQR: ${state.processingQR}`, 'qr');
+  log(`   resetting: ${state.resetting}`, 'qr');
+  log(`   keyboardActive: ${state.globalKeyListener ? 'YES' : 'NO'}`, 'qr');
+  log(`   lastActivity: ${Math.round(timeSinceActivity/1000)}s ago`, 'qr');
+  log(`   lastRestart: ${Math.round(timeSinceRestart/1000)}s ago`, 'qr');
+  log(`   compactorRunning: ${state.compactorRunning}`, 'qr');
+  
   if (state.processingQR && state.processingQRTimeout === null) {
-    log('processingQR stuck - clearing', 'warning');
+    log('⚠️ processingQR stuck without timeout!', 'warning');
     clearQRProcessing();
   }
   
   if (!state.globalKeyListener && state.isReady && !state.autoCycleEnabled) {
-    log('Keyboard listener missing - recreating', 'warning');
+    log('⚠️ Keyboard listener missing - recreating!', 'warning');
     setupQRScanner();
   }
   
-  if (!state.autoCycleEnabled && state.isReady && timeSinceActivity > 180000) {
-    log('No keyboard activity - restarting listener', 'warning');
-    
-    if (state.globalKeyListener) {
-      try {
-        state.globalKeyListener.kill();
-      } catch (e) {
-        // Ignore
-      }
-      state.globalKeyListener = null;
-    }
-    
-    setupQRScanner();
-    state.lastKeyboardActivity = Date.now();
-  }
+  const canScan = canAcceptQRScan();
+  log(`   ${canScan ? '✅ READY FOR SCAN' : '❌ NOT READY'}`, 'qr');
+  log('━'.repeat(50), 'qr');
 }
 
 // ============================================
@@ -535,6 +717,12 @@ const heartbeat = {
     this.stateCheckInterval = setInterval(() => {
       checkScannerHealth();
     }, CONFIG.heartbeat.stateCheckInterval * 1000);
+    
+    log(`💓 Heartbeat started: ${this.timeout}s`, 'info');
+    log(`🔍 Health checks: ${CONFIG.heartbeat.stateCheckInterval}s`, 'info');
+    
+    // 🆕 Start scanner health monitor
+    startScannerHealthMonitor();
   },
   
   stop() {
@@ -546,6 +734,12 @@ const heartbeat = {
     if (this.stateCheckInterval) {
       clearInterval(this.stateCheckInterval);
       this.stateCheckInterval = null;
+    }
+    
+    // 🆕 Stop scanner health monitor
+    if (state.scannerHealthTimer) {
+      clearInterval(state.scannerHealthTimer);
+      state.scannerHealthTimer = null;
     }
   },
   
@@ -562,11 +756,11 @@ const heartbeat = {
         
         if (!state.isReady) {
           state.isReady = true;
-          
-          // Set stepper motor moduleId dynamically
-          CONFIG.motors.stepper.moduleId = state.moduleId;
-          
-          console.log('🟢 SYSTEM READY');
+          log('========================================');
+          log('🟢 SYSTEM READY');
+          log('========================================');
+          log(`📱 Module ID: ${state.moduleId}`);
+          log('========================================\n');
           
           setupQRScanner();
           
@@ -576,7 +770,6 @@ const heartbeat = {
             event: 'startup_ready',
             moduleId: state.moduleId,
             isReady: true,
-            optimizedMode: true,
             timestamp
           }));
           
@@ -604,17 +797,20 @@ const heartbeat = {
       canAcceptQRScan: canAcceptQRScan(),
       processingQR: state.processingQR,
       keyboardListenerActive: state.globalKeyListener !== null,
+      compactorRunning: state.compactorRunning,
       lastCycleTime: state.lastCycleTime,
-      averageCycleTime: state.averageCycleTime,
-      cycleCount: state.cycleCount,
-      optimizedMode: true,
       timestamp
     }));
     
-    // Minimal heartbeat output
-    const status = state.autoCycleEnabled ? 'SESSION' : (canAcceptQRScan() ? 'READY' : 'BUSY');
-    const perf = state.lastCycleTime ? ` ${(state.lastCycleTime/1000).toFixed(1)}s` : '';
-    console.log(`💓 ${status}${perf}`);
+    const scanStatus = canAcceptQRScan() ? '🟢 READY' : '🔴 BUSY';
+    const compactorStatus = state.compactorRunning ? '🔨 CRUSHING' : '⚪ IDLE';
+    const perfInfo = state.lastCycleTime ? ` | ${(state.lastCycleTime/1000).toFixed(1)}s` : '';
+    
+    console.log(`💓 ${state.isReady ? '🟢' : '🟡'} | ` +
+                `Module: ${state.moduleId || 'NONE'} | ` +
+                `Session: ${state.autoCycleEnabled ? 'ACTIVE' : 'IDLE'} | ` +
+                `Scanner: ${scanStatus} | ` +
+                `Compactor: ${compactorStatus}${perfInfo}`);
   }
 };
 
@@ -637,7 +833,7 @@ async function requestModuleId() {
 // ============================================
 function runDiagnostics() {
   console.log('\n' + '='.repeat(60));
-  console.log('🔬 SYSTEM DIAGNOSTICS - ULTRA FAST MODE');
+  console.log('🔬 SYSTEM DIAGNOSTICS');
   console.log('='.repeat(60));
   
   console.log('\n📱 QR Scanner:');
@@ -646,14 +842,12 @@ function runDiagnostics() {
   console.log(`   Can accept scan: ${canAcceptQRScan() ? '✅ YES' : '❌ NO'}`);
   console.log(`   Buffer: "${state.qrBuffer}"`);
   console.log(`   Last activity: ${Math.round((Date.now() - state.lastKeyboardActivity)/1000)}s ago`);
+  console.log(`   Last restart: ${Math.round((Date.now() - state.lastScannerRestart)/1000)}s ago`);
   
-  console.log('\n🎯 System:');
-  console.log(`   isReady: ${state.isReady}`);
-  console.log(`   autoCycle: ${state.autoCycleEnabled}`);
-  console.log(`   resetting: ${state.resetting}`);
-  console.log(`   moduleId: ${state.moduleId}`);
-  console.log(`   stepperModuleId: ${CONFIG.motors.stepper.moduleId || 'NOT SET'}`);
-  console.log(`   compactorRunning: ${state.compactorRunning}`);
+  console.log('\n🔨 Compactor:');
+  console.log(`   Running: ${state.compactorRunning ? '✅ YES' : '❌ NO'}`);
+  console.log(`   Last item: ${state.lastItemTime ? Math.round((Date.now() - state.lastItemTime)/1000) + 's ago' : 'N/A'}`);
+  console.log(`   Idle timer: ${state.compactorIdleTimer ? '⏰ ACTIVE' : '❌ NONE'}`);
   
   console.log('\n🗑️ Bin Status:');
   console.log(`   Plastic (Left): ${state.binStatus.plastic ? '❌ FULL' : '✅ OK'}`);
@@ -661,23 +855,12 @@ function runDiagnostics() {
   console.log(`   Right Bin: ${state.binStatus.right ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Glass: ${state.binStatus.glass ? '❌ FULL' : '✅ OK'}`);
   
-  console.log('\n⚡ Performance (Optimized Timings):');
-  console.log(`   Belt to stepper: ${CONFIG.timing.beltToStepper}ms (was 3500ms)`);
-  console.log(`   Stepper rotate: ${CONFIG.timing.stepperRotate}ms (was 3500ms) 🚀`);
-  console.log(`   Stepper reset: ${CONFIG.timing.stepperReset}ms (was 5000ms) 🚀`);
-  console.log(`   Belt reverse: ${CONFIG.timing.beltReverse}ms (was 4000ms)`);
-  console.log(`   Auto photo delay: ${CONFIG.timing.autoPhotoDelay}ms (was 3000ms)`);
-  
-  if (state.cycleCount > 0) {
-    console.log('\n📊 Cycle Statistics:');
-    console.log(`   Total cycles: ${state.cycleCount}`);
-    console.log(`   Last cycle: ${(state.lastCycleTime / 1000).toFixed(1)}s`);
-    console.log(`   Average: ${(state.averageCycleTime / 1000).toFixed(1)}s`);
-    const expectedOldTime = 45;
-    const timeSavedPerCycle = expectedOldTime - (state.averageCycleTime / 1000);
-    console.log(`   Time saved per cycle: ~${timeSavedPerCycle.toFixed(1)}s`);
-    console.log(`   Total time saved: ~${(timeSavedPerCycle * state.cycleCount).toFixed(1)}s`);
-  }
+  console.log('\n🎯 System:');
+  console.log(`   isReady: ${state.isReady}`);
+  console.log(`   autoCycle: ${state.autoCycleEnabled}`);
+  console.log(`   resetting: ${state.resetting}`);
+  console.log(`   moduleId: ${state.moduleId}`);
+  console.log(`   cycleInProgress: ${state.cycleInProgress}`);
   
   console.log('\n' + '='.repeat(60) + '\n');
 }
@@ -770,7 +953,7 @@ async function executeCommand(action, params = {}) {
     case 'stepperMotor':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/stepMotorSelect`;
       apiPayload = {
-        moduleId: CONFIG.motors.stepper.moduleId || state.moduleId, // Use stepper moduleId or fall back to main moduleId
+        moduleId: CONFIG.motors.stepper.moduleId,
         id: params.position,
         type: params.position,
         deviceType
@@ -807,44 +990,20 @@ async function executeCommand(action, params = {}) {
 }
 
 // ============================================
-// COMPACTOR & OPTIMIZED CYCLE
+// REJECTION CYCLE
 // ============================================
-async function startCompactor() {
-  if (state.compactorRunning) {
-    await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-    
-    if (state.compactorTimer) {
-      clearTimeout(state.compactorTimer);
-      state.compactorTimer = null;
-    }
-    
-    state.compactorRunning = false;
-    await delay(500);
-  }
-  
-  state.compactorRunning = true;
-  
-  await executeCommand('customMotor', CONFIG.motors.compactor.start);
-  
-  state.compactorTimer = setTimeout(async () => {
-    try {
-      await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-    } catch (error) {
-      log(`Compactor stop error: ${error.message}`, 'error');
-    }
-    
-    state.compactorRunning = false;
-    state.compactorTimer = null;
-  }, CONFIG.timing.compactor);
-}
-
 async function executeRejectionCycle() {
-  console.log('❌ Rejection');
+  console.log('\n' + '='.repeat(50));
+  console.log('❌ REJECTION CYCLE - REVERSING BELT');
+  console.log('='.repeat(50) + '\n');
 
   try {
+    log('⚠️ Reversing belt to reject item', 'warning');
     await executeCommand('customMotor', CONFIG.motors.belt.reverse);
     await delay(CONFIG.timing.beltReverse);
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    
+    log('✅ Item rejected', 'crusher');
 
     mqttClient.publish('rvm/RVM-3101/item/rejected', JSON.stringify({
       deviceId: CONFIG.device.id,
@@ -879,10 +1038,9 @@ async function executeRejectionCycle() {
 }
 
 // ============================================
-// ULTRA-FAST OPTIMIZED CYCLE
-// Based on manufacturer specs + 10% safety margin
+// AUTO CYCLE
 // ============================================
-async function executeAutoCycleUltraFast() {
+async function executeAutoCycle() {
   if (!state.aiResult || !state.weight || state.weight.weight <= 1) {
     state.cycleInProgress = false;
     return;
@@ -901,48 +1059,37 @@ async function executeAutoCycleUltraFast() {
     timestamp: new Date().toISOString()
   };
   
-  console.log(`⚡ Cycle #${state.itemsProcessed}: ${cycleData.material} ${cycleData.weight}g`);
+  console.log('\n' + '='.repeat(50));
+  console.log(`⚡ CYCLE #${state.itemsProcessed} - MAXIMUM SPEED`);
+  console.log('='.repeat(50) + '\n');
 
   try {
-    // Belt to stepper
+    await startContinuousCompactor();
+    
+    log('⚡ Moving belt to stepper...', 'info');
     await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
     await delay(CONFIG.timing.beltToStepper);
+    
+    await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    log('✅ Belt stopped - item will drop by gravity', 'success');
 
-    // Rotate stepper
     const targetPosition = cycleData.material === 'METAL_CAN' 
       ? CONFIG.motors.stepper.positions.metalCan
       : CONFIG.motors.stepper.positions.plasticBottle;
     
+    log(`🔄 Stepper → ${cycleData.material}...`, 'info');
     await executeCommand('stepperMotor', { position: targetPosition });
     await delay(CONFIG.timing.stepperRotate);
 
-    // Drop bottle
-    await executeCommand('customMotor', CONFIG.motors.belt.reverse);
-    await delay(CONFIG.timing.beltReverse);
-    await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    log('⏳ Waiting for gravity drop...', 'info');
+    await delay(CONFIG.timing.itemDropDelay);
 
-    // Parallel: Reset stepper + Start next detection
-    const parallelOperations = Promise.all([
-      (async () => {
-        await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
-        await delay(CONFIG.timing.stepperReset);
-      })(),
-      
-      (async () => {
-        await delay(300);
-        if (state.autoCycleEnabled && !state.awaitingDetection) {
-          state.awaitingDetection = true;
-          await executeCommand('takePhoto');
-        }
-      })()
-    ]);
+    log('🔄 Stepper → home...', 'info');
+    await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
+    await delay(CONFIG.timing.stepperReset);
+    log('✅ Stepper at home', 'success');
 
-    // Start compactor (background)
-    startCompactor().catch(error => {
-      log(`Compactor error: ${error.message}`, 'error');
-    });
-
-    await parallelOperations;
+    log('🔨 Compactor crushing continuously...', 'crusher');
 
     mqttClient.publish(CONFIG.mqtt.topics.cycleComplete, JSON.stringify(cycleData));
 
@@ -957,13 +1104,29 @@ async function executeAutoCycleUltraFast() {
   state.weight = null;
   state.cycleInProgress = false;
   state.detectionRetries = 0;
+  state.awaitingDetection = false;
+
+  if (state.autoCycleEnabled) {
+    if (state.autoPhotoTimer) {
+      clearTimeout(state.autoPhotoTimer);
+    }
+    
+    state.autoPhotoTimer = setTimeout(() => {
+      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+        state.awaitingDetection = true;
+        executeCommand('takePhoto');
+      }
+    }, CONFIG.timing.autoPhotoDelay);
+  }
 }
 
 // ============================================
 // SESSION MANAGEMENT
 // ============================================
 async function startMemberSession(validationData) {
-  console.log(`🎬 SESSION: ${validationData.user.name}`);
+  console.log('\n' + '='.repeat(50));
+  console.log('🎬 MEMBER SESSION START - MAXIMUM SPEED MODE');
+  console.log('='.repeat(50));
   
   try {
     state.isReady = false;
@@ -986,14 +1149,7 @@ async function startMemberSession(validationData) {
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
     
-    if (state.compactorRunning) {
-      await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-      if (state.compactorTimer) {
-        clearTimeout(state.compactorTimer);
-        state.compactorTimer = null;
-      }
-      state.compactorRunning = false;
-    }
+    await stopCompactor();
     
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.resetHomeDelay);
@@ -1003,11 +1159,12 @@ async function startMemberSession(validationData) {
     
     await executeCommand('openGate');
     await delay(CONFIG.timing.commandDelay);
+    log('🚪 Gate opened for session', 'success');
     
     mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
       deviceId: CONFIG.device.id,
       state: 'session_active',
-      message: 'Insert your items - ultra fast mode!',
+      message: 'Insert your items',
       user: {
         name: validationData.user.name,
         currentPoints: validationData.user.currentPoints
@@ -1023,7 +1180,6 @@ async function startMemberSession(validationData) {
       userId: state.currentUserId,
       sessionId: state.sessionId,
       sessionCode: state.sessionCode,
-      optimizedMode: true,
       timestamp: new Date().toISOString()
     }));
     
@@ -1038,15 +1194,19 @@ async function startMemberSession(validationData) {
       }
     }, CONFIG.timing.autoPhotoDelay);
     
+    log('⚡ Session started - Maximum speed mode!', 'success');
+    
   } catch (error) {
-    log(`Session start error: ${error.message}`, 'error');
+    log(`❌ Session start error: ${error.message}`, 'error');
     await resetSystemForNextUser(true);
     throw error;
   }
 }
 
 async function startGuestSession(sessionData) {
-  console.log('🎬 GUEST SESSION');
+  console.log('\n' + '='.repeat(50));
+  console.log('🎬 GUEST SESSION START - MAXIMUM SPEED MODE');
+  console.log('='.repeat(50));
   
   try {
     state.isReady = false;
@@ -1065,14 +1225,7 @@ async function startGuestSession(sessionData) {
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
     
-    if (state.compactorRunning) {
-      await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-      if (state.compactorTimer) {
-        clearTimeout(state.compactorTimer);
-        state.compactorTimer = null;
-      }
-      state.compactorRunning = false;
-    }
+    await stopCompactor();
     
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.resetHomeDelay);
@@ -1082,11 +1235,12 @@ async function startGuestSession(sessionData) {
     
     await executeCommand('openGate');
     await delay(CONFIG.timing.commandDelay);
+    log('🚪 Gate opened for session', 'success');
     
     mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
       deviceId: CONFIG.device.id,
       state: 'session_active',
-      message: 'Insert your items - ultra fast mode!',
+      message: 'Insert your items',
       sessionType: 'guest',
       timestamp: new Date().toISOString()
     }));
@@ -1098,7 +1252,6 @@ async function startGuestSession(sessionData) {
       sessionType: 'guest',
       sessionId: state.sessionId,
       sessionCode: state.sessionCode,
-      optimizedMode: true,
       timestamp: new Date().toISOString()
     }));
     
@@ -1113,15 +1266,20 @@ async function startGuestSession(sessionData) {
       }
     }, CONFIG.timing.autoPhotoDelay);
     
+    log('⚡ Guest session started - Maximum speed mode!', 'success');
+    
   } catch (error) {
-    log(`Session start error: ${error.message}`, 'error');
+    log(`❌ Session start error: ${error.message}`, 'error');
     await resetSystemForNextUser(true);
     throw error;
   }
 }
 
+// 🆕 FIXED: Restart QR scanner after session ends
 async function resetSystemForNextUser(forceStop = false) {
-  console.log('🔄 RESET');
+  console.log('\n' + '='.repeat(50));
+  console.log('🔄 RESET FOR NEXT USER');
+  console.log('='.repeat(50) + '\n');
   
   if (state.resetting) {
     return;
@@ -1142,24 +1300,27 @@ async function resetSystemForNextUser(forceStop = false) {
       const maxWait = 60000;
       const startWait = Date.now();
       
+      log('⏳ Waiting for current cycle to complete...', 'info');
+      
       while (state.cycleInProgress && (Date.now() - startWait) < maxWait) {
         await delay(2000);
       }
     }
     
-    if (state.compactorRunning) {
-      if (forceStop) {
-        await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-        if (state.compactorTimer) {
-          clearTimeout(state.compactorTimer);
-          state.compactorTimer = null;
-        }
-        state.compactorRunning = false;
+    if (forceStop) {
+      log('🛑 Force stopping compactor', 'warning');
+      await stopCompactor();
+    } else {
+      if (state.compactorRunning) {
+        log('⏳ Compactor finishing current cycle...', 'info');
+        await delay(2000);
+        await stopCompactor();
       }
     }
     
     await executeCommand('closeGate');
     await delay(CONFIG.timing.commandDelay);
+    log('🚪 Gate closed', 'success');
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
 
@@ -1179,6 +1340,7 @@ async function resetSystemForNextUser(forceStop = false) {
     state.detectionRetries = 0;
     state.isMember = false;
     state.isGuestSession = false;
+    state.lastItemTime = null;
     
     clearSessionTimers();
     clearQRProcessing();
@@ -1186,7 +1348,17 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady = true;
     
-    console.log('✅ READY');
+    // 🆕 CRITICAL FIX: Restart QR scanner after session
+    if (CONFIG.qr.restartAfterSession) {
+      log('🔄 Restarting QR scanner after session...', 'warning');
+      setTimeout(() => {
+        forceRestartScanner();
+      }, 1500);
+    }
+    
+    console.log('='.repeat(50));
+    console.log('✅ READY FOR NEXT USER');
+    console.log('='.repeat(50) + '\n');
     
     mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
       deviceId: CONFIG.device.id,
@@ -1194,7 +1366,6 @@ async function resetSystemForNextUser(forceStop = false) {
       event: 'reset_complete',
       isReady: true,
       autoCycleEnabled: false,
-      optimizedMode: true,
       timestamp: new Date().toISOString()
     }));
     
@@ -1204,6 +1375,8 @@ async function resetSystemForNextUser(forceStop = false) {
       message: 'Please scan your QR code',
       timestamp: new Date().toISOString()
     }));
+    
+    log('✅ System ready - QR scanner active', 'success');
   }
 }
 
@@ -1307,6 +1480,8 @@ function connectWebSocket() {
   state.ws = new WebSocket(CONFIG.local.wsUrl);
   
   state.ws.on('open', () => {
+    log('✅ WebSocket connected', 'success');
+    
     if (!state.moduleId) {
       setTimeout(() => requestModuleId(), 1000);
     }
@@ -1318,16 +1493,15 @@ function connectWebSocket() {
       
       if (message.function === '01') {
         state.moduleId = message.moduleId;
+        log(`✅ Module ID: ${state.moduleId}`, 'success');
         
         heartbeat.moduleIdRetries = 0;
         
         if (!state.isReady) {
           state.isReady = true;
-          
-          // Set stepper motor moduleId dynamically
-          CONFIG.motors.stepper.moduleId = state.moduleId;
-          
-          console.log('🟢 SYSTEM READY');
+          log('========================================');
+          log('🟢 SYSTEM READY - MAXIMUM SPEED MODE');
+          log('========================================');
           
           setupQRScanner();
           
@@ -1336,7 +1510,6 @@ function connectWebSocket() {
             status: 'ready',
             moduleId: state.moduleId,
             isReady: true,
-            optimizedMode: true,
             timestamp: new Date().toISOString()
           }));
           
@@ -1369,7 +1542,9 @@ function connectWebSocket() {
           if (state.aiResult.materialType !== 'UNKNOWN') {
             state.detectionRetries = 0;
             state.awaitingDetection = false;
+            
             setTimeout(() => executeCommand('getWeight'), 300);
+            
           } else {
             state.detectionRetries++;
             
@@ -1381,15 +1556,45 @@ function connectWebSocket() {
               }, CONFIG.detection.retryDelay);
             } else {
               state.awaitingDetection = false;
-              state.cycleInProgress = true;
-              setTimeout(() => executeRejectionCycle(), 1000);
+              
+              setTimeout(async () => {
+                try {
+                  await executeCommand('getWeight');
+                  
+                  await delay(CONFIG.timing.weightDelay + 500);
+                  
+                  if (state.weight && state.weight.weight >= CONFIG.detection.minValidWeight) {
+                    state.cycleInProgress = true;
+                    setTimeout(() => executeRejectionCycle(), 500);
+                  } else {
+                    log('No item detected - skipping rejection', 'crusher');
+                    state.aiResult = null;
+                    state.weight = null;
+                    state.detectionRetries = 0;
+                    
+                    if (state.autoCycleEnabled) {
+                      state.autoPhotoTimer = setTimeout(() => {
+                        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+                          state.awaitingDetection = true;
+                          executeCommand('takePhoto');
+                        }
+                      }, CONFIG.timing.autoPhotoDelay);
+                    }
+                  }
+                } catch (error) {
+                  log(`Weight check error: ${error.message}`, 'error');
+                  state.aiResult = null;
+                  state.weight = null;
+                  state.detectionRetries = 0;
+                  state.awaitingDetection = false;
+                }
+              }, 300);
             }
           }
         }
         return;
       }
       
-      // Handle bin status from hardware
       if (message.function === 'deviceStatus') {
         const binCode = parseInt(message.data);
         
@@ -1404,14 +1609,12 @@ function connectWebSocket() {
         const binInfo = binStatusMap[binCode];
         
         if (binInfo) {
-          console.log(`⚠️ BIN STATUS: ${binInfo.name} bin full (code: ${binCode})`);
+          log(`⚠️ BIN STATUS: ${binInfo.name} bin full (code: ${binCode})`, 'warning');
           
-          // Update state
           if (binInfo.key) {
             state.binStatus[binInfo.key] = true;
           }
           
-          // Publish to MQTT
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binCode: binCode,
@@ -1423,7 +1626,6 @@ function connectWebSocket() {
             timestamp: new Date().toISOString()
           }));
           
-          // Publish to screen
           mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
             deviceId: CONFIG.device.id,
             state: 'bin_full_warning',
@@ -1432,11 +1634,9 @@ function connectWebSocket() {
             timestamp: new Date().toISOString()
           }));
           
-          // If critical bin is full during session, handle it
           if (binInfo.critical && state.autoCycleEnabled) {
             log(`Critical bin full: ${binInfo.name}`, 'warning');
             
-            // Check if the current material's bin is full
             const currentMaterialBin = state.aiResult?.materialType === 'METAL_CAN' ? 'metal' : 'plastic';
             
             if (binInfo.key === currentMaterialBin) {
@@ -1498,7 +1698,7 @@ function connectWebSocket() {
           }
           
           state.cycleInProgress = true;
-          setTimeout(() => executeAutoCycleUltraFast(), 500);
+          setTimeout(() => executeAutoCycle(), 500);
         }
         return;
       }
@@ -1535,7 +1735,6 @@ mqttClient.on('connect', () => {
     deviceId: CONFIG.device.id,
     status: 'online',
     event: 'device_connected',
-    optimizedMode: true,
     timestamp: new Date().toISOString()
   }), { retain: true });
   
@@ -1544,7 +1743,6 @@ mqttClient.on('connect', () => {
     status: 'ready',
     event: 'startup_ready',
     isReady: true,
-    optimizedMode: true,
     timestamp: new Date().toISOString()
   }));
   
@@ -1584,10 +1782,8 @@ mqttClient.on('message', async (topic, message) => {
           autoCycleEnabled: state.autoCycleEnabled,
           resetting: state.resetting,
           processingQR: state.processingQR,
+          compactorRunning: state.compactorRunning,
           moduleId: state.moduleId,
-          optimizedMode: true,
-          cycleCount: state.cycleCount,
-          averageCycleTime: state.averageCycleTime,
           timestamp: new Date().toISOString()
         }));
         
@@ -1598,11 +1794,7 @@ mqttClient.on('message', async (topic, message) => {
         await executeCommand('closeGate');
         await executeCommand('customMotor', CONFIG.motors.belt.stop);
         
-        if (state.compactorRunning) {
-          await executeCommand('customMotor', CONFIG.motors.compactor.stop);
-          if (state.compactorTimer) clearTimeout(state.compactorTimer);
-          state.compactorRunning = false;
-        }
+        await stopCompactor();
         
         state.autoCycleEnabled = false;
         state.cycleInProgress = false;
@@ -1628,6 +1820,13 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
+      // 🆕 Manual scanner restart command
+      if (payload.action === 'restartScanner') {
+        log('🔄 Manual scanner restart requested', 'info');
+        forceRestartScanner();
+        return;
+      }
+      
       if (payload.action === 'getBinStatus') {
         mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
           deviceId: CONFIG.device.id,
@@ -1638,13 +1837,12 @@ mqttClient.on('message', async (topic, message) => {
       }
       
       if (payload.action === 'resetBinStatus') {
-        // Reset all bin statuses (after emptying bins)
         state.binStatus.plastic = false;
         state.binStatus.metal = false;
         state.binStatus.right = false;
         state.binStatus.glass = false;
         
-        console.log('🗑️ Bin status reset');
+        log('🗑️ Bin status reset', 'critical');
         
         mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
           deviceId: CONFIG.device.id,
@@ -1684,12 +1882,13 @@ mqttClient.on('error', (error) => {
 // SHUTDOWN
 // ============================================
 function gracefulShutdown() {
-  console.log('\n⏹️ Shutting down ultra-fast agent...\n');
+  console.log('\n⏹️ Shutting down...\n');
   
   clearQRProcessing();
   heartbeat.stop();
   
-  if (state.compactorTimer) clearTimeout(state.compactorTimer);
+  stopCompactor();
+  
   if (state.autoPhotoTimer) clearTimeout(state.autoPhotoTimer);
   
   clearSessionTimers();
@@ -1740,9 +1939,14 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(60));
-console.log('🚀 RVM AGENT - ULTRA FAST (OPTIMIZED)');
+console.log('🚀 RVM AGENT - FIXED QR SCANNER VERSION');
 console.log('='.repeat(60));
-console.log(`Device: ${CONFIG.device.id}`);
-console.log('Stepper: 880ms (was 3500ms) | Belt: 1980ms (was 3500ms)');
-console.log('Expected: 15-20s per bottle (vs 45s)');
+console.log(`📱 Device: ${CONFIG.device.id}`);
+console.log('✅ Gate stays open during session!');
+console.log('🔨 Compactor runs continuously!');
+console.log('⚡ No belt reverse for accepted items!');
+console.log('🔄 QR scanner auto-restarts after sessions!');
+console.log('💊 Health monitoring enabled!');
 console.log('='.repeat(60) + '\n');
+
+log('🚀 Starting fixed agent with QR recovery...', 'info');

@@ -1,4 +1,4 @@
-// agent-qr-ultra-reliable-optimized.js - FIXED VERSION WITH QR RECOVERY & IMMEDIATE GATE CLOSE
+// agent-qr-ultra-reliable-optimized.js - UPDATED WITH NEW AI FORMAT
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -851,6 +851,9 @@ function runDiagnostics() {
   console.log('\n' + '='.repeat(60) + '\n');
 }
 
+// ============================================
+// MATERIAL TYPE DETECTION - UPDATED
+// ============================================
 function determineMaterialType(aiData) {
   const className = (aiData.className || '').toLowerCase();
   const probability = aiData.probability || 0;
@@ -859,22 +862,39 @@ function determineMaterialType(aiData) {
   let threshold = 1.0;
   let hasStrongKeyword = false;
   
-  if (className.includes('易拉罐') || className.includes('metal') || 
-      className.includes('can') || className.includes('铝')) {
+  // New format: "1-Can" or "0-PET"
+  if (className.includes('1-can') || className === '1-can') {
+    materialType = 'METAL_CAN';
+    threshold = CONFIG.detection.METAL_CAN;
+    hasStrongKeyword = true;
+    log(`🔍 Detected new format: ${aiData.className} → METAL_CAN`, 'debug');
+  } 
+  else if (className.includes('0-pet') || className === '0-pet') {
+    materialType = 'PLASTIC_BOTTLE';
+    threshold = CONFIG.detection.PLASTIC_BOTTLE;
+    hasStrongKeyword = true;
+    log(`🔍 Detected new format: ${aiData.className} → PLASTIC_BOTTLE`, 'debug');
+  }
+  // Legacy format support
+  else if (className.includes('易拉罐') || className.includes('metal') || 
+           className.includes('can') || className.includes('铝')) {
     materialType = 'METAL_CAN';
     threshold = CONFIG.detection.METAL_CAN;
     hasStrongKeyword = className.includes('易拉罐') || className.includes('铝');
+    log(`🔍 Detected legacy format → METAL_CAN`, 'debug');
   } 
   else if (className.includes('pet') || className.includes('plastic') || 
            className.includes('瓶') || className.includes('bottle')) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
     hasStrongKeyword = className.includes('pet');
+    log(`🔍 Detected legacy format → PLASTIC_BOTTLE`, 'debug');
   } 
   else if (className.includes('玻璃') || className.includes('glass')) {
     materialType = 'GLASS';
     threshold = CONFIG.detection.GLASS;
     hasStrongKeyword = className.includes('玻璃');
+    log(`🔍 Detected legacy format → GLASS`, 'debug');
   }
   
   const confidencePercent = Math.round(probability * 100);
@@ -883,16 +903,18 @@ function determineMaterialType(aiData) {
     const relaxedThreshold = threshold * 0.3;
     
     if (hasStrongKeyword && probability >= relaxedThreshold) {
-      log(`${materialType} (${confidencePercent}% - keyword match)`, 'success');
+      log(`✅ ${materialType} (${confidencePercent}% - keyword match)`, 'success');
       return materialType;
     }
     
-    log(`${materialType} too low (${confidencePercent}%)`, 'warning');
+    log(`⚠️ ${materialType} confidence too low (${confidencePercent}% < ${Math.round(threshold * 100)}%)`, 'warning');
     return 'UNKNOWN';
   }
   
   if (materialType !== 'UNKNOWN') {
-    log(`${materialType} (${confidencePercent}%)`, 'success');
+    log(`✅ ${materialType} detected (${confidencePercent}%)`, 'success');
+  } else {
+    log(`❌ Unknown material: ${aiData.className} (${confidencePercent}%)`, 'warning');
   }
   
   return materialType;
@@ -1926,9 +1948,10 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(60));
-console.log('🚀 RVM AGENT - FIXED QR SCANNER + IMMEDIATE GATE CLOSE');
+console.log('🚀 RVM AGENT - UPDATED AI FORMAT (1-Can, 0-PET)');
 console.log('='.repeat(60));
 console.log(`📱 Device: ${CONFIG.device.id}`);
+console.log('✅ New AI format: 1-Can, 0-PET');
 console.log('✅ Gate stays open during session!');
 console.log('🚨 Gate closes IMMEDIATELY on session end!');
 console.log('🔨 Compactor runs continuously!');
@@ -1937,4 +1960,4 @@ console.log('🔄 QR scanner auto-restarts after sessions!');
 console.log('💊 Health monitoring enabled!');
 console.log('='.repeat(60) + '\n');
 
-log('🚀 Starting fixed agent with QR recovery & immediate gate close...', 'info');
+log('🚀 Starting agent with updated AI format support...', 'info');

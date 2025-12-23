@@ -1,4 +1,4 @@
-// agent-qr-ultra-reliable-optimized.js - UPDATED WITH NEW AI FORMAT
+// agent-qr-ultra-reliable-optimized-v2.js - OPTIMIZED DETECTION
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -6,7 +6,7 @@ const WebSocket = require('ws');
 const { GlobalKeyboardListener } = require('node-global-key-listener');
 
 // ============================================
-// CONFIGURATION
+// CONFIGURATION - OPTIMIZED
 // ============================================
 const CONFIG = {
   device: {
@@ -76,10 +76,17 @@ const CONFIG = {
     METAL_CAN: 0.22,
     PLASTIC_BOTTLE: 0.30,
     GLASS: 0.25,
-    retryDelay: 1500,
+    retryDelay: 2000,           // Increased from 1500ms
     maxRetries: 2,
     hasObjectSensor: false,
-    minValidWeight: 1  // Changed from 5g to 1g
+    minValidWeight: 1,
+    
+    // NEW: Enhanced detection settings
+    prePhotoStabilization: 800,  // Stop belt before photo
+    postPhotoDelay: 600,         // Wait after photo for processing
+    cameraWarmupDelay: 1500,     // First photo of session
+    useAdaptiveTiming: true,     // Learn from success patterns
+    minConfidenceRetry: 0.15     // Retry if confidence is this low
   },
   
   timing: {
@@ -90,17 +97,18 @@ const CONFIG = {
     stepperReset: 3500,
     compactorCycle: 22000,
     compactorIdleStop: 8000,
-    positionSettle: 300,
+    positionSettle: 500,         // Increased from 300ms
     gateOperation: 800,
-    autoPhotoDelay: 2500,
+    autoPhotoDelay: 3500,        // Increased from 2500ms - MORE TIME between items
     sessionTimeout: 120000,
     sessionMaxDuration: 600000,
     weightDelay: 1200,
-    photoDelay: 1000,
+    photoDelay: 1200,            // Increased from 1000ms
     calibrationDelay: 1000,
     commandDelay: 100,
     resetHomeDelay: 1200,
-    itemDropDelay: 800
+    itemDropDelay: 800,
+    beltStopSettle: 600          // NEW: Wait after stopping belt
   },
   
   heartbeat: {
@@ -115,7 +123,7 @@ const CONFIG = {
 };
 
 // ============================================
-// STATE MANAGEMENT
+// STATE MANAGEMENT - ENHANCED
 // ============================================
 const state = {
   moduleId: null,
@@ -151,6 +159,7 @@ const state = {
   lastActivityTime: null,
   sessionTimeoutTimer: null,
   maxDurationTimer: null,
+  isFirstPhotoOfSession: true,  // NEW: Track first photo
   
   // Continuous compactor state
   compactorRunning: false,
@@ -162,6 +171,7 @@ const state = {
   detectionRetries: 0,
   awaitingDetection: false,
   resetting: false,
+  beltMoving: false,            // NEW: Track belt state
   
   // Bin status tracking
   binStatus: {
@@ -171,10 +181,21 @@ const state = {
     glass: false
   },
   
-  // Performance tracking
+  // Performance tracking - ENHANCED
   lastCycleTime: null,
   averageCycleTime: null,
-  cycleCount: 0
+  cycleCount: 0,
+  
+  // NEW: Detection analytics
+  detectionStats: {
+    totalAttempts: 0,
+    firstTimeSuccess: 0,
+    secondTimeSuccess: 0,
+    thirdTimeSuccess: 0,
+    failures: 0,
+    averageRetries: 0,
+    lastSuccessfulTiming: null
+  }
 };
 
 // ============================================
@@ -192,7 +213,9 @@ function log(message, level = 'info') {
     'debug': '🔍',
     'perf': '⚡',
     'qr': '📱',
-    'crusher': '🔨'
+    'crusher': '🔨',
+    'camera': '📸',
+    'detection': '🎯'
   }[level] || 'ℹ️';
   
   console.log(`[${timestamp}] ${prefix} ${message}`);
@@ -218,8 +241,112 @@ function trackCycleTime(startTime) {
   log(`⚡ Cycle completed in ${(cycleTime / 1000).toFixed(1)}s | Avg: ${(state.averageCycleTime / 1000).toFixed(1)}s`, 'perf');
 }
 
+// NEW: Track detection statistics
+function trackDetectionAttempt(success, retryCount) {
+  state.detectionStats.totalAttempts++;
+  
+  if (success) {
+    if (retryCount === 0) {
+      state.detectionStats.firstTimeSuccess++;
+    } else if (retryCount === 1) {
+      state.detectionStats.secondTimeSuccess++;
+    } else if (retryCount === 2) {
+      state.detectionStats.thirdTimeSuccess++;
+    }
+    
+    state.detectionStats.lastSuccessfulTiming = {
+      retries: retryCount,
+      timestamp: new Date().toISOString()
+    };
+  } else {
+    state.detectionStats.failures++;
+  }
+  
+  // Calculate average retries
+  const totalRetries = 
+    (state.detectionStats.secondTimeSuccess * 1) + 
+    (state.detectionStats.thirdTimeSuccess * 2);
+  const successfulAttempts = 
+    state.detectionStats.firstTimeSuccess + 
+    state.detectionStats.secondTimeSuccess + 
+    state.detectionStats.thirdTimeSuccess;
+  
+  if (successfulAttempts > 0) {
+    state.detectionStats.averageRetries = totalRetries / successfulAttempts;
+  }
+  
+  // Log stats every 10 items
+  if (state.detectionStats.totalAttempts % 10 === 0) {
+    logDetectionStats();
+  }
+}
+
+function logDetectionStats() {
+  const stats = state.detectionStats;
+  const total = stats.firstTimeSuccess + stats.secondTimeSuccess + stats.thirdTimeSuccess + stats.failures;
+  
+  if (total === 0) return;
+  
+  const firstTimeRate = ((stats.firstTimeSuccess / total) * 100).toFixed(1);
+  const secondTimeRate = ((stats.secondTimeSuccess / total) * 100).toFixed(1);
+  
+  log('\n' + '='.repeat(60), 'detection');
+  log('📊 DETECTION STATISTICS', 'detection');
+  log('='.repeat(60), 'detection');
+  log(`Total Attempts: ${stats.totalAttempts}`, 'detection');
+  log(`First Time Success: ${stats.firstTimeSuccess} (${firstTimeRate}%)`, 'detection');
+  log(`Second Time Success: ${stats.secondTimeSuccess} (${secondTimeRate}%)`, 'detection');
+  log(`Third Time Success: ${stats.thirdTimeSuccess}`, 'detection');
+  log(`Failures: ${stats.failures}`, 'detection');
+  log(`Average Retries: ${stats.averageRetries.toFixed(2)}`, 'detection');
+  log('='.repeat(60) + '\n', 'detection');
+}
+
 // ============================================
-// QR SCANNER - FIXED VERSION
+// BELT CONTROL - NEW FUNCTIONS
+// ============================================
+async function stopBeltAndStabilize() {
+  if (!state.beltMoving) {
+    debugLog('Belt already stopped');
+    return;
+  }
+  
+  log('🛑 Stopping belt for photo...', 'camera');
+  await executeCommand('customMotor', CONFIG.motors.belt.stop);
+  state.beltMoving = false;
+  
+  // Wait for mechanical stabilization
+  log(`⏳ Waiting ${CONFIG.timing.beltStopSettle}ms for stabilization...`, 'camera');
+  await delay(CONFIG.timing.beltStopSettle);
+  log('✅ Belt stabilized', 'camera');
+}
+
+async function takePhotoWithPreparation() {
+  // Stop belt first for stable photo
+  await stopBeltAndStabilize();
+  
+  // First photo of session needs extra warm-up
+  if (state.isFirstPhotoOfSession) {
+    log(`📸 First photo - warming up camera (${CONFIG.detection.cameraWarmupDelay}ms)...`, 'camera');
+    await delay(CONFIG.detection.cameraWarmupDelay);
+    state.isFirstPhotoOfSession = false;
+  }
+  
+  // Additional stabilization
+  await delay(CONFIG.detection.prePhotoStabilization);
+  
+  log('📸 Taking photo...', 'camera');
+  await executeCommand('takePhoto');
+  
+  // Wait for AI processing to start
+  if (CONFIG.detection.postPhotoDelay > 0) {
+    debugLog(`⏳ Post-photo delay: ${CONFIG.detection.postPhotoDelay}ms`);
+    await delay(CONFIG.detection.postPhotoDelay);
+  }
+}
+
+// ============================================
+// QR SCANNER
 // ============================================
 
 function canAcceptQRScan() {
@@ -785,18 +912,21 @@ const heartbeat = {
       keyboardListenerActive: state.globalKeyListener !== null,
       compactorRunning: state.compactorRunning,
       lastCycleTime: state.lastCycleTime,
+      detectionStats: state.detectionStats,
       timestamp
     }));
     
     const scanStatus = canAcceptQRScan() ? '🟢 READY' : '🔴 BUSY';
     const compactorStatus = state.compactorRunning ? '🔨 CRUSHING' : '⚪ IDLE';
     const perfInfo = state.lastCycleTime ? ` | ${(state.lastCycleTime/1000).toFixed(1)}s` : '';
+    const detectionInfo = state.detectionStats.totalAttempts > 0 ? 
+      ` | 1st:${((state.detectionStats.firstTimeSuccess/state.detectionStats.totalAttempts)*100).toFixed(0)}%` : '';
     
     console.log(`💓 ${state.isReady ? '🟢' : '🟡'} | ` +
                 `Module: ${state.moduleId || 'NONE'} | ` +
                 `Session: ${state.autoCycleEnabled ? 'ACTIVE' : 'IDLE'} | ` +
                 `Scanner: ${scanStatus} | ` +
-                `Compactor: ${compactorStatus}${perfInfo}`);
+                `Compactor: ${compactorStatus}${perfInfo}${detectionInfo}`);
   }
 };
 
@@ -815,7 +945,7 @@ async function requestModuleId() {
 }
 
 // ============================================
-// DIAGNOSTICS
+// DIAGNOSTICS - ENHANCED
 // ============================================
 function runDiagnostics() {
   console.log('\n' + '='.repeat(60));
@@ -847,16 +977,24 @@ function runDiagnostics() {
   console.log(`   resetting: ${state.resetting}`);
   console.log(`   moduleId: ${state.moduleId}`);
   console.log(`   cycleInProgress: ${state.cycleInProgress}`);
+  console.log(`   beltMoving: ${state.beltMoving}`);
+  console.log(`   isFirstPhoto: ${state.isFirstPhotoOfSession}`);
   
   console.log('\n' + '='.repeat(60) + '\n');
+  
+  logDetectionStats();
 }
 
 // ============================================
-// MATERIAL TYPE DETECTION - UPDATED
+// MATERIAL TYPE DETECTION - OPTIMIZED
 // ============================================
 function determineMaterialType(aiData) {
   const className = (aiData.className || '').toLowerCase();
   const probability = aiData.probability || 0;
+  
+  log(`\n🔍 AI DETECTION ANALYSIS:`, 'detection');
+  log(`   Raw className: "${aiData.className}"`, 'detection');
+  log(`   Probability: ${(probability * 100).toFixed(2)}%`, 'detection');
   
   let materialType = 'UNKNOWN';
   let threshold = 1.0;
@@ -867,13 +1005,13 @@ function determineMaterialType(aiData) {
     materialType = 'METAL_CAN';
     threshold = CONFIG.detection.METAL_CAN;
     hasStrongKeyword = true;
-    log(`🔍 Detected new format: ${aiData.className} → METAL_CAN`, 'debug');
+    log(`   ✅ New format detected: METAL_CAN`, 'detection');
   } 
   else if (className.includes('0-pet') || className === '0-pet') {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
     hasStrongKeyword = true;
-    log(`🔍 Detected new format: ${aiData.className} → PLASTIC_BOTTLE`, 'debug');
+    log(`   ✅ New format detected: PLASTIC_BOTTLE`, 'detection');
   }
   // Legacy format support
   else if (className.includes('易拉罐') || className.includes('metal') || 
@@ -881,41 +1019,53 @@ function determineMaterialType(aiData) {
     materialType = 'METAL_CAN';
     threshold = CONFIG.detection.METAL_CAN;
     hasStrongKeyword = className.includes('易拉罐') || className.includes('铝');
-    log(`🔍 Detected legacy format → METAL_CAN`, 'debug');
+    log(`   ✅ Legacy format detected: METAL_CAN`, 'detection');
   } 
   else if (className.includes('pet') || className.includes('plastic') || 
            className.includes('瓶') || className.includes('bottle')) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
     hasStrongKeyword = className.includes('pet');
-    log(`🔍 Detected legacy format → PLASTIC_BOTTLE`, 'debug');
+    log(`   ✅ Legacy format detected: PLASTIC_BOTTLE`, 'detection');
   } 
   else if (className.includes('玻璃') || className.includes('glass')) {
     materialType = 'GLASS';
     threshold = CONFIG.detection.GLASS;
     hasStrongKeyword = className.includes('玻璃');
-    log(`🔍 Detected legacy format → GLASS`, 'debug');
+    log(`   ✅ Legacy format detected: GLASS`, 'detection');
   }
   
   const confidencePercent = Math.round(probability * 100);
+  
+  log(`   Material: ${materialType}`, 'detection');
+  log(`   Threshold: ${Math.round(threshold * 100)}%`, 'detection');
+  log(`   Strong keyword: ${hasStrongKeyword}`, 'detection');
+  
+  // Check for very low confidence that warrants immediate retry
+  if (probability < CONFIG.detection.minConfidenceRetry && materialType === 'UNKNOWN') {
+    log(`   ⚠️ VERY LOW confidence (${confidencePercent}%) - likely bad photo`, 'warning');
+    return 'UNKNOWN';
+  }
   
   if (materialType !== 'UNKNOWN' && probability < threshold) {
     const relaxedThreshold = threshold * 0.3;
     
     if (hasStrongKeyword && probability >= relaxedThreshold) {
-      log(`✅ ${materialType} (${confidencePercent}% - keyword match)`, 'success');
+      log(`   ✅ ACCEPTED via keyword (${confidencePercent}% >= ${Math.round(relaxedThreshold * 100)}%)`, 'success');
       return materialType;
     }
     
-    log(`⚠️ ${materialType} confidence too low (${confidencePercent}% < ${Math.round(threshold * 100)}%)`, 'warning');
+    log(`   ❌ REJECTED - Low confidence (${confidencePercent}% < ${Math.round(threshold * 100)}%)`, 'warning');
     return 'UNKNOWN';
   }
   
   if (materialType !== 'UNKNOWN') {
-    log(`✅ ${materialType} detected (${confidencePercent}%)`, 'success');
+    log(`   ✅ ACCEPTED - ${materialType} (${confidencePercent}%)`, 'success');
   } else {
-    log(`❌ Unknown material: ${aiData.className} (${confidencePercent}%)`, 'warning');
+    log(`   ❌ UNKNOWN material`, 'warning');
   }
+  
+  log(`${'─'.repeat(50)}\n`, 'detection');
   
   return materialType;
 }
@@ -976,6 +1126,15 @@ async function executeCommand(action, params = {}) {
         type: params.type,
         deviceType
       };
+      
+      // Track belt state
+      if (params.motorId === '02') {
+        if (params.type === '00') {
+          state.beltMoving = false;
+        } else {
+          state.beltMoving = true;
+        }
+      }
       break;
       
     default:
@@ -1013,11 +1172,15 @@ async function executeRejectionCycle() {
     
     log('✅ Item rejected', 'crusher');
 
+    // Track rejection in stats
+    trackDetectionAttempt(false, state.detectionRetries);
+
     mqttClient.publish('rvm/RVM-3101/item/rejected', JSON.stringify({
       deviceId: CONFIG.device.id,
       reason: 'LOW_CONFIDENCE',
       userId: state.currentUserId,
       sessionCode: state.sessionCode,
+      retries: state.detectionRetries,
       timestamp: new Date().toISOString()
     }));
 
@@ -1036,17 +1199,20 @@ async function executeRejectionCycle() {
       clearTimeout(state.autoPhotoTimer);
     }
     
+    // Reset for next item
+    state.isFirstPhotoOfSession = false;
+    
     state.autoPhotoTimer = setTimeout(() => {
       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
         state.awaitingDetection = true;
-        executeCommand('takePhoto');
+        takePhotoWithPreparation();
       }
     }, CONFIG.timing.autoPhotoDelay);
   }
 }
 
 // ============================================
-// AUTO CYCLE
+// AUTO CYCLE - OPTIMIZED
 // ============================================
 async function executeAutoCycle() {
   if (!state.aiResult || !state.weight || state.weight.weight <= 1) {
@@ -1058,6 +1224,9 @@ async function executeAutoCycle() {
   const cycleStartTime = Date.now();
   state.itemsProcessed++;
   
+  // Track successful detection
+  trackDetectionAttempt(true, state.detectionRetries);
+  
   const cycleData = {
     deviceId: CONFIG.device.id,
     material: state.aiResult.materialType,
@@ -1065,6 +1234,7 @@ async function executeAutoCycle() {
     userId: state.currentUserId,
     sessionCode: state.sessionCode,
     itemNumber: state.itemsProcessed,
+    detectionRetries: state.detectionRetries,
     timestamp: new Date().toISOString()
   };
   
@@ -1072,6 +1242,7 @@ async function executeAutoCycle() {
   console.log(`⚡ CYCLE #${state.itemsProcessed} - MAXIMUM SPEED`);
   console.log(`   Material: ${cycleData.material}`);
   console.log(`   Weight: ${cycleData.weight}g`);
+  console.log(`   Detection tries: ${state.detectionRetries + 1}`);
   console.log('='.repeat(50) + '\n');
 
   try {
@@ -1119,6 +1290,7 @@ async function executeAutoCycle() {
   state.cycleInProgress = false;
   state.detectionRetries = 0;
   state.awaitingDetection = false;
+  state.isFirstPhotoOfSession = false; // Reset for next item
 
   if (state.autoCycleEnabled) {
     if (state.autoPhotoTimer) {
@@ -1130,7 +1302,7 @@ async function executeAutoCycle() {
       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
         log('📸 Taking next photo...', 'info');
         state.awaitingDetection = true;
-        executeCommand('takePhoto');
+        takePhotoWithPreparation();
       }
     }, CONFIG.timing.autoPhotoDelay);
   }
@@ -1141,7 +1313,7 @@ async function executeAutoCycle() {
 // ============================================
 async function startMemberSession(validationData) {
   console.log('\n' + '='.repeat(50));
-  console.log('🎬 MEMBER SESSION START - MAXIMUM SPEED MODE');
+  console.log('🎬 MEMBER SESSION START - OPTIMIZED DETECTION MODE');
   console.log('='.repeat(50));
   
   try {
@@ -1161,9 +1333,13 @@ async function startMemberSession(validationData) {
     state.autoCycleEnabled = true;
     state.itemsProcessed = 0;
     state.sessionStartTime = new Date();
+    state.isFirstPhotoOfSession = true; // Important!
+    state.detectionRetries = 0;
+    
     startSessionTimers();
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    state.beltMoving = false;
     
     await stopCompactor();
     
@@ -1203,14 +1379,15 @@ async function startMemberSession(validationData) {
       clearTimeout(state.autoPhotoTimer);
     }
     
+    log('⏰ Scheduling first photo with camera warm-up...', 'camera');
     state.autoPhotoTimer = setTimeout(() => {
       if (state.autoCycleEnabled) {
         state.awaitingDetection = true;
-        executeCommand('takePhoto');
+        takePhotoWithPreparation(); // Uses camera warm-up for first photo
       }
     }, CONFIG.timing.autoPhotoDelay);
     
-    log('⚡ Session started - Maximum speed mode!', 'success');
+    log('⚡ Session started - Optimized detection mode!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1221,7 +1398,7 @@ async function startMemberSession(validationData) {
 
 async function startGuestSession(sessionData) {
   console.log('\n' + '='.repeat(50));
-  console.log('🎬 GUEST SESSION START - MAXIMUM SPEED MODE');
+  console.log('🎬 GUEST SESSION START - OPTIMIZED DETECTION MODE');
   console.log('='.repeat(50));
   
   try {
@@ -1237,9 +1414,13 @@ async function startGuestSession(sessionData) {
     state.autoCycleEnabled = true;
     state.itemsProcessed = 0;
     state.sessionStartTime = new Date();
+    state.isFirstPhotoOfSession = true; // Important!
+    state.detectionRetries = 0;
+    
     startSessionTimers();
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    state.beltMoving = false;
     
     await stopCompactor();
     
@@ -1275,14 +1456,15 @@ async function startGuestSession(sessionData) {
       clearTimeout(state.autoPhotoTimer);
     }
     
+    log('⏰ Scheduling first photo with camera warm-up...', 'camera');
     state.autoPhotoTimer = setTimeout(() => {
       if (state.autoCycleEnabled) {
         state.awaitingDetection = true;
-        executeCommand('takePhoto');
+        takePhotoWithPreparation(); // Uses camera warm-up for first photo
       }
     }, CONFIG.timing.autoPhotoDelay);
     
-    log('⚡ Guest session started - Maximum speed mode!', 'success');
+    log('⚡ Guest session started - Optimized detection mode!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1342,6 +1524,7 @@ async function resetSystemForNextUser(forceStop = false) {
     }
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    state.beltMoving = false;
 
   } catch (error) {
     log(`Reset error: ${error.message}`, 'error');
@@ -1360,6 +1543,7 @@ async function resetSystemForNextUser(forceStop = false) {
     state.isMember = false;
     state.isGuestSession = false;
     state.lastItemTime = null;
+    state.isFirstPhotoOfSession = true;
     
     clearSessionTimers();
     clearQRProcessing();
@@ -1518,7 +1702,7 @@ function connectWebSocket() {
         if (!state.isReady) {
           state.isReady = true;
           log('========================================');
-          log('🟢 SYSTEM READY - MAXIMUM SPEED MODE');
+          log('🟢 SYSTEM READY - OPTIMIZED DETECTION');
           log('========================================');
           
           setupQRScanner();
@@ -1546,7 +1730,7 @@ function connectWebSocket() {
         const aiData = JSON.parse(message.data);
         const materialType = determineMaterialType(aiData);
         
-        log(`📸 AI Detection: ${aiData.className} (${Math.round((aiData.probability || 0) * 100)}%) → ${materialType}`, 'info');
+        log(`📸 AI Detection (#${state.detectionRetries + 1}): ${aiData.className} → ${materialType}`, 'camera');
         
         state.aiResult = {
           matchRate: Math.round((aiData.probability || 0) * 100),
@@ -1559,7 +1743,7 @@ function connectWebSocket() {
         mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
         
         if (state.autoCycleEnabled && state.awaitingDetection) {
-          log(`🔍 Processing detection - Material: ${materialType}, Awaiting: ${state.awaitingDetection}, InProgress: ${state.cycleInProgress}`, 'debug');
+          log(`🔍 Processing detection - Material: ${materialType}, Retry: ${state.detectionRetries}/${CONFIG.detection.maxRetries}`, 'debug');
           
           if (state.aiResult.materialType !== 'UNKNOWN') {
             state.detectionRetries = 0;
@@ -1573,12 +1757,16 @@ function connectWebSocket() {
             log(`⚠️ Unknown material - retry ${state.detectionRetries}/${CONFIG.detection.maxRetries}`, 'warning');
             
             if (state.detectionRetries < CONFIG.detection.maxRetries) {
+              // Calculate adaptive retry delay
+              const retryDelay = CONFIG.detection.retryDelay * (state.detectionRetries * 0.5 + 1);
+              
+              log(`⏰ Retrying in ${retryDelay}ms...`, 'warning');
               setTimeout(() => {
                 if (state.autoCycleEnabled) {
                   log('🔄 Retrying photo...', 'info');
-                  executeCommand('takePhoto');
+                  takePhotoWithPreparation(); // Use optimized photo taking
                 }
-              }, CONFIG.detection.retryDelay);
+              }, retryDelay);
             } else {
               state.awaitingDetection = false;
               
@@ -1609,7 +1797,7 @@ function connectWebSocket() {
                     state.autoPhotoTimer = setTimeout(() => {
                       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
                         state.awaitingDetection = true;
-                        executeCommand('takePhoto');
+                        takePhotoWithPreparation();
                       }
                     }, CONFIG.timing.autoPhotoDelay);
                   }
@@ -1716,6 +1904,7 @@ function connectWebSocket() {
             state.aiResult = null;
             state.weight = null;
             state.awaitingDetection = false;
+            state.detectionRetries = 0;
             
             if (state.autoPhotoTimer) {
               clearTimeout(state.autoPhotoTimer);
@@ -1725,7 +1914,7 @@ function connectWebSocket() {
             state.autoPhotoTimer = setTimeout(() => {
               if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
                 state.awaitingDetection = true;
-                executeCommand('takePhoto');
+                takePhotoWithPreparation();
               }
             }, CONFIG.timing.autoPhotoDelay);
             
@@ -1822,15 +2011,22 @@ mqttClient.on('message', async (topic, message) => {
           processingQR: state.processingQR,
           compactorRunning: state.compactorRunning,
           moduleId: state.moduleId,
+          detectionStats: state.detectionStats,
           timestamp: new Date().toISOString()
         }));
         
         return;
       }
       
+      if (payload.action === 'getDetectionStats') {
+        logDetectionStats();
+        return;
+      }
+      
       if (payload.action === 'emergencyStop') {
         await executeCommand('closeGate');
         await executeCommand('customMotor', CONFIG.motors.belt.stop);
+        state.beltMoving = false;
         
         await stopCompactor();
         
@@ -1879,7 +2075,7 @@ mqttClient.on('message', async (topic, message) => {
         state.binStatus.right = false;
         state.binStatus.glass = false;
         
-        log('🗑️ Bin status reset', 'critical');
+        log('🗑️ Bin status reset', 'success');
         
         mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
           deviceId: CONFIG.device.id,
@@ -1976,16 +2172,14 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(60));
-console.log('🚀 RVM AGENT - UPDATED AI FORMAT (1-Can, 0-PET)');
+console.log('🚀 RVM AGENT V2 - OPTIMIZED DETECTION');
 console.log('='.repeat(60));
 console.log(`📱 Device: ${CONFIG.device.id}`);
-console.log('✅ New AI format: 1-Can, 0-PET');
-console.log('✅ Gate stays open during session!');
-console.log('🚨 Gate closes IMMEDIATELY on session end!');
-console.log('🔨 Compactor runs continuously!');
-console.log('⚡ No belt reverse for accepted items!');
-console.log('🔄 QR scanner auto-restarts after sessions!');
-console.log('💊 Health monitoring enabled!');
+console.log('✅ Enhanced detection reliability!');
+console.log('📸 Belt stops before photos!');
+console.log('🔥 Camera warm-up for first photo!');
+console.log('⏱️ Adaptive retry timing!');
+console.log('📊 Detection analytics tracking!');
 console.log('='.repeat(60) + '\n');
 
-log('🚀 Starting agent with updated AI format support...', 'info');
+log('🚀 Starting optimized agent...', 'info');

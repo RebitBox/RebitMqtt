@@ -306,22 +306,26 @@ function logDetectionStats() {
 // BELT CONTROL - NEW FUNCTIONS
 // ============================================
 async function stopBeltAndStabilize() {
-  if (!state.beltMoving) {
-    debugLog('Belt already stopped');
-    return;
+  if (state.beltMoving) {
+    log('🛑 Stopping belt for photo...', 'camera');
+    await executeCommand('customMotor', CONFIG.motors.belt.stop);
+    state.beltMoving = false;
+    
+    // Wait for mechanical stabilization after stopping
+    log(`⏳ Waiting ${CONFIG.timing.beltStopSettle}ms for belt stabilization...`, 'camera');
+    await delay(CONFIG.timing.beltStopSettle);
+  } else {
+    debugLog('Belt already stopped - applying stabilization delay');
+    // Even if belt is stopped, apply a smaller stabilization delay
+    await delay(CONFIG.timing.positionSettle);
   }
   
-  log('🛑 Stopping belt for photo...', 'camera');
-  await executeCommand('customMotor', CONFIG.motors.belt.stop);
-  state.beltMoving = false;
-  
-  // Wait for mechanical stabilization
-  log(`⏳ Waiting ${CONFIG.timing.beltStopSettle}ms for stabilization...`, 'camera');
-  await delay(CONFIG.timing.beltStopSettle);
   log('✅ Belt stabilized', 'camera');
 }
 
 async function takePhotoWithPreparation() {
+  log('📸 PHOTO PREPARATION START', 'camera');
+  
   // Stop belt first for stable photo
   await stopBeltAndStabilize();
   
@@ -330,19 +334,22 @@ async function takePhotoWithPreparation() {
     log(`📸 First photo - warming up camera (${CONFIG.detection.cameraWarmupDelay}ms)...`, 'camera');
     await delay(CONFIG.detection.cameraWarmupDelay);
     state.isFirstPhotoOfSession = false;
+  } else {
+    // Subsequent photos still need stabilization
+    log(`⏳ Pre-photo stabilization (${CONFIG.detection.prePhotoStabilization}ms)...`, 'camera');
+    await delay(CONFIG.detection.prePhotoStabilization);
   }
   
-  // Additional stabilization
-  await delay(CONFIG.detection.prePhotoStabilization);
-  
-  log('📸 Taking photo...', 'camera');
+  log('📸 Taking photo NOW...', 'camera');
   await executeCommand('takePhoto');
   
   // Wait for AI processing to start
   if (CONFIG.detection.postPhotoDelay > 0) {
-    debugLog(`⏳ Post-photo delay: ${CONFIG.detection.postPhotoDelay}ms`);
+    log(`⏳ Post-photo delay: ${CONFIG.detection.postPhotoDelay}ms`, 'camera');
     await delay(CONFIG.detection.postPhotoDelay);
   }
+  
+  log('✅ Photo sequence complete', 'camera');
 }
 
 // ============================================
@@ -1202,10 +1209,15 @@ async function executeRejectionCycle() {
     // Reset for next item
     state.isFirstPhotoOfSession = false;
     
-    state.autoPhotoTimer = setTimeout(() => {
+    state.autoPhotoTimer = setTimeout(async () => {
       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        state.awaitingDetection = true;
-        takePhotoWithPreparation();
+        try {
+          state.awaitingDetection = true;
+          await takePhotoWithPreparation();
+        } catch (error) {
+          log(`❌ Post-rejection photo error: ${error.message}`, 'error');
+          state.awaitingDetection = false;
+        }
       }
     }, CONFIG.timing.autoPhotoDelay);
   }
@@ -1298,11 +1310,16 @@ async function executeAutoCycle() {
     }
     
     log(`⏰ Scheduling next photo in ${CONFIG.timing.autoPhotoDelay}ms`, 'debug');
-    state.autoPhotoTimer = setTimeout(() => {
+    state.autoPhotoTimer = setTimeout(async () => {
       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        log('📸 Taking next photo...', 'info');
-        state.awaitingDetection = true;
-        takePhotoWithPreparation();
+        try {
+          log('📸 Taking next photo...', 'info');
+          state.awaitingDetection = true;
+          await takePhotoWithPreparation();
+        } catch (error) {
+          log(`❌ Next photo error: ${error.message}`, 'error');
+          state.awaitingDetection = false;
+        }
       }
     }, CONFIG.timing.autoPhotoDelay);
   }
@@ -1380,10 +1397,29 @@ async function startMemberSession(validationData) {
     }
     
     log('⏰ Scheduling first photo with camera warm-up...', 'camera');
-    state.autoPhotoTimer = setTimeout(() => {
+    state.autoPhotoTimer = setTimeout(async () => {
       if (state.autoCycleEnabled) {
-        state.awaitingDetection = true;
-        takePhotoWithPreparation(); // Uses camera warm-up for first photo
+        try {
+          log('⏰ AUTO PHOTO TIMER FIRED (MEMBER) - Starting photo sequence', 'camera');
+          state.awaitingDetection = true;
+          await takePhotoWithPreparation();
+        } catch (error) {
+          log(`❌ Photo preparation error: ${error.message}`, 'error');
+          console.error(error.stack);
+          
+          // Reset state and retry
+          state.awaitingDetection = false;
+          if (state.autoCycleEnabled) {
+            setTimeout(() => {
+              if (state.autoCycleEnabled && !state.cycleInProgress) {
+                state.awaitingDetection = true;
+                takePhotoWithPreparation().catch(e => log(`Retry error: ${e.message}`, 'error'));
+              }
+            }, 2000);
+          }
+        }
+      } else {
+        log('⚠️ Photo timer fired but autoCycleEnabled is false', 'warning');
       }
     }, CONFIG.timing.autoPhotoDelay);
     
@@ -1457,10 +1493,29 @@ async function startGuestSession(sessionData) {
     }
     
     log('⏰ Scheduling first photo with camera warm-up...', 'camera');
-    state.autoPhotoTimer = setTimeout(() => {
+    state.autoPhotoTimer = setTimeout(async () => {
       if (state.autoCycleEnabled) {
-        state.awaitingDetection = true;
-        takePhotoWithPreparation(); // Uses camera warm-up for first photo
+        try {
+          log('⏰ AUTO PHOTO TIMER FIRED (GUEST) - Starting photo sequence', 'camera');
+          state.awaitingDetection = true;
+          await takePhotoWithPreparation();
+        } catch (error) {
+          log(`❌ Photo preparation error: ${error.message}`, 'error');
+          console.error(error.stack);
+          
+          // Reset state and retry
+          state.awaitingDetection = false;
+          if (state.autoCycleEnabled) {
+            setTimeout(() => {
+              if (state.autoCycleEnabled && !state.cycleInProgress) {
+                state.awaitingDetection = true;
+                takePhotoWithPreparation().catch(e => log(`Retry error: ${e.message}`, 'error'));
+              }
+            }, 2000);
+          }
+        }
+      } else {
+        log('⚠️ Photo timer fired but autoCycleEnabled is false', 'warning');
       }
     }, CONFIG.timing.autoPhotoDelay);
     
@@ -1761,10 +1816,15 @@ function connectWebSocket() {
               const retryDelay = CONFIG.detection.retryDelay * (state.detectionRetries * 0.5 + 1);
               
               log(`⏰ Retrying in ${retryDelay}ms...`, 'warning');
-              setTimeout(() => {
+              setTimeout(async () => {
                 if (state.autoCycleEnabled) {
-                  log('🔄 Retrying photo...', 'info');
-                  takePhotoWithPreparation(); // Use optimized photo taking
+                  try {
+                    log('🔄 Retrying photo...', 'info');
+                    await takePhotoWithPreparation();
+                  } catch (error) {
+                    log(`❌ Retry photo error: ${error.message}`, 'error');
+                    state.awaitingDetection = false;
+                  }
                 }
               }, retryDelay);
             } else {
@@ -1794,10 +1854,15 @@ function connectWebSocket() {
                   
                   // Still continue auto cycle
                   if (state.autoCycleEnabled) {
-                    state.autoPhotoTimer = setTimeout(() => {
+                    state.autoPhotoTimer = setTimeout(async () => {
                       if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-                        state.awaitingDetection = true;
-                        takePhotoWithPreparation();
+                        try {
+                          state.awaitingDetection = true;
+                          await takePhotoWithPreparation();
+                        } catch (error) {
+                          log(`❌ Error recovery photo error: ${error.message}`, 'error');
+                          state.awaitingDetection = false;
+                        }
                       }
                     }, CONFIG.timing.autoPhotoDelay);
                   }
@@ -1911,10 +1976,15 @@ function connectWebSocket() {
             }
             
             log('⏰ Scheduling next photo (low weight)', 'debug');
-            state.autoPhotoTimer = setTimeout(() => {
+            state.autoPhotoTimer = setTimeout(async () => {
               if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-                state.awaitingDetection = true;
-                takePhotoWithPreparation();
+                try {
+                  state.awaitingDetection = true;
+                  await takePhotoWithPreparation();
+                } catch (error) {
+                  log(`❌ Low weight retry photo error: ${error.message}`, 'error');
+                  state.awaitingDetection = false;
+                }
               }
             }, CONFIG.timing.autoPhotoDelay);
             

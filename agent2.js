@@ -1033,7 +1033,7 @@ async function executeCommand(action, params = {}) {
       
     case 'closeGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
-      apiPayload = { moduleId: state.moduleId, motorId: '01', type: '00', deviceType };
+      apiPayload = { moduleId: state.moduleId, motorId: '01', type: '01', deviceType };
       break;
       
     case 'getWeight':
@@ -1397,6 +1397,15 @@ async function resetSystemForNextUser(forceStop = false) {
   state.resetting = true;
   
   try {
+    // 🚨 CLOSE GATE IMMEDIATELY - First thing!
+    try {
+      await executeCommand('closeGate');
+      log('🚪 Gate closed immediately', 'success');
+    } catch (error) {
+      log(`Gate close error (non-fatal): ${error.message}`, 'error');
+    }
+    
+    // Now stop the session
     state.autoCycleEnabled = false;
     state.awaitingDetection = false;
     
@@ -1405,6 +1414,7 @@ async function resetSystemForNextUser(forceStop = false) {
       state.autoPhotoTimer = null;
     }
     
+    // Wait for current cycle to complete
     if (state.cycleInProgress) {
       const maxWait = 60000;
       const startWait = Date.now();
@@ -1416,6 +1426,7 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
+    // Stop compactor
     if (forceStop) {
       log('🛑 Force stopping compactor', 'warning');
       await stopCompactor();
@@ -1427,10 +1438,7 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
-    await executeCommand('closeGate');
-    await delay(CONFIG.timing.commandDelay);
-    log('🚪 Gate closed', 'success');
-    
+    // Stop belt
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
 
   } catch (error) {

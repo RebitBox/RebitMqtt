@@ -1682,7 +1682,7 @@ function connectWebSocket() {
         return;
       }
       
-     if (message.function === 'aiPhoto') {
+if (message.function === 'aiPhoto') {
   const aiData = JSON.parse(message.data);
   const materialType = determineMaterialType(aiData);
   
@@ -1698,53 +1698,20 @@ function connectWebSocket() {
   
   if (state.autoCycleEnabled && state.awaitingDetection) {
     if (state.aiResult.materialType !== 'UNKNOWN') {
-      // Material detected successfully
+      // Material detected successfully - proceed to get weight
       state.detectionRetries = 0;
       state.awaitingDetection = false;
       
       setTimeout(() => executeCommand('getWeight'), 300);
       
     } else {
-      // UNKNOWN material - REJECT IMMEDIATELY
-      log(`❌ UNKNOWN material detected - rejecting immediately`, 'warning');
+      // UNKNOWN material - REJECT IMMEDIATELY WITHOUT WEIGHT CHECK
+      log(`❌ UNKNOWN material detected - rejecting immediately (no weight check)`, 'warning');
       state.awaitingDetection = false;
+      state.cycleInProgress = true;
       
-      setTimeout(async () => {
-        try {
-          // Check if there's actually an item on the belt
-          await executeCommand('getWeight');
-          await delay(CONFIG.timing.weightDelay + 500);
-          
-          if (state.weight && state.weight.weight >= CONFIG.detection.minValidWeight) {
-            // Item detected - execute rejection cycle immediately
-            log(`⚠️ Item weight: ${state.weight.weight}g - executing immediate rejection`, 'warning');
-            state.cycleInProgress = true;
-            setTimeout(() => executeRejectionCycle(), 500);
-          } else {
-            // No item or very light item - skip rejection
-            log('No significant item detected - skipping rejection', 'crusher');
-            state.aiResult = null;
-            state.weight = null;
-            state.detectionRetries = 0;
-            
-            // Continue with next photo
-            if (state.autoCycleEnabled) {
-              state.autoPhotoTimer = setTimeout(() => {
-                if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-                  state.awaitingDetection = true;
-                  executeCommand('takePhoto');
-                }
-              }, CONFIG.timing.autoPhotoDelay);
-            }
-          }
-        } catch (error) {
-          log(`Weight check error: ${error.message}`, 'error');
-          state.aiResult = null;
-          state.weight = null;
-          state.detectionRetries = 0;
-          state.awaitingDetection = false;
-        }
-      }, 300);
+      // Execute rejection immediately - no weight check needed
+      setTimeout(() => executeRejectionCycle(), 500);
     }
   }
   return;
@@ -1807,7 +1774,7 @@ function connectWebSocket() {
         return;
       }
       
-      if (message.function === '06') {
+if (message.function === '06') {
   const weightValue = parseFloat(message.data) || 0;
   const coefficient = CONFIG.weight.coefficients[1];
   const calibratedWeight = weightValue * (coefficient / 1000);
@@ -1832,35 +1799,19 @@ function connectWebSocket() {
   
   if (state.weight.weight > 0) state.calibrationAttempts = 0;
   
+  // Only process weight for KNOWN materials (UNKNOWN items are already rejected)
   if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
-    // 🚨 CHECK IF MATERIAL IS UNKNOWN - REJECT IT!
+    // Safety check: if somehow UNKNOWN material got here, reject it
     if (state.aiResult.materialType === 'UNKNOWN') {
-      if (state.weight.weight >= CONFIG.detection.minValidWeight) {
-        log(`❌ UNKNOWN material with weight ${state.weight.weight}g - REJECTING`, 'warning');
-        state.cycleInProgress = true;
-        setTimeout(() => executeRejectionCycle(), 500);
-      } else {
-        log('UNKNOWN material but weight too low - skipping', 'crusher');
-        state.aiResult = null;
-        state.weight = null;
-        state.awaitingDetection = false;
-        
-        if (state.autoPhotoTimer) {
-          clearTimeout(state.autoPhotoTimer);
-        }
-        
-        state.autoPhotoTimer = setTimeout(() => {
-          if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-            state.awaitingDetection = true;
-            executeCommand('takePhoto');
-          }
-        }, CONFIG.timing.autoPhotoDelay);
-      }
+      log(`⚠️ UNKNOWN material in weight handler - rejecting`, 'warning');
+      state.cycleInProgress = true;
+      setTimeout(() => executeRejectionCycle(), 500);
       return;
     }
     
-    // Normal flow for known materials
+    // Check weight for known materials
     if (state.weight.weight < CONFIG.detection.minValidWeight) {
+      log(`Known material but weight too low (${state.weight.weight}g) - skipping`, 'crusher');
       state.aiResult = null;
       state.weight = null;
       state.awaitingDetection = false;

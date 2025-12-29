@@ -73,15 +73,15 @@ const CONFIG = {
   },
   
   detection: {
-    METAL_CAN: 0.22,
-    PLASTIC_BOTTLE: 0.30,
-    GLASS: 0.25,
-    retryDelay: 1500,
-    maxRetries: 2,
-    hasObjectSensor: false,
-    minValidWeight: 5,
-    minConfidenceRetry: 0.15
-  },
+  METAL_CAN: 0.20,      // Lowered from 0.22
+  PLASTIC_BOTTLE: 0.25, // Lowered from 0.30
+  GLASS: 0.25,
+  retryDelay: 1500,
+  maxRetries: 2,
+  hasObjectSensor: false,
+  minValidWeight: 5,
+  minConfidenceRetry: 0.12  // Lowered from 0.15 for new format
+},
   
   timing: {
     beltToWeight: 2500,
@@ -932,7 +932,7 @@ function runDiagnostics() {
 // MATERIAL TYPE DETECTION - IMPROVED VERSION
 // ============================================
 function determineMaterialType(aiData) {
-  const className = (aiData.className || '').toLowerCase();
+  const className = (aiData.className || '').toLowerCase().trim();
   const probability = aiData.probability || 0;
   
   log(`\n🔍 AI DETECTION ANALYSIS:`, 'detection');
@@ -942,45 +942,79 @@ function determineMaterialType(aiData) {
   let materialType = 'UNKNOWN';
   let threshold = 1.0;
   let hasStrongKeyword = false;
+  let detectionFormat = 'unknown';
   
-  // New format: "1-Can" or "0-PET"
-  if (className.includes('1-can') || className === '1-can') {
-    materialType = 'METAL_CAN';
-    threshold = CONFIG.detection.METAL_CAN;
-    hasStrongKeyword = true;
-    log(`   ✅ New format detected: METAL_CAN`, 'detection');
-  } 
-  else if (className.includes('0-pet') || className === '0-pet') {
+  // Priority 1: New standardized format "0-PET" or "1-Can"
+  if (className === '0-pet' || className.startsWith('0-pet')) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
     hasStrongKeyword = true;
-    log(`   ✅ New format detected: PLASTIC_BOTTLE`, 'detection');
-  }
-  // Legacy format support
-  else if (className.includes('易拉罐') || className.includes('metal') || 
-           className.includes('can') || className.includes('铝')) {
+    detectionFormat = 'new_standard';
+    log(`   ✅ New format detected: PLASTIC_BOTTLE (0-PET)`, 'detection');
+  } 
+  else if (className === '1-can' || className.startsWith('1-can')) {
     materialType = 'METAL_CAN';
     threshold = CONFIG.detection.METAL_CAN;
-    hasStrongKeyword = className.includes('易拉罐') || className.includes('铝');
-    log(`   ✅ Legacy format detected: METAL_CAN`, 'detection');
+    hasStrongKeyword = true;
+    detectionFormat = 'new_standard';
+    log(`   ✅ New format detected: METAL_CAN (1-Can)`, 'detection');
+  }
+  // Priority 2: Check for number prefix format variations
+  else if (/^0[-_\s]*(pet|plastic|bottle)/i.test(className)) {
+    materialType = 'PLASTIC_BOTTLE';
+    threshold = CONFIG.detection.PLASTIC_BOTTLE;
+    hasStrongKeyword = true;
+    detectionFormat = 'variant_format';
+    log(`   ✅ Variant format detected: PLASTIC_BOTTLE`, 'detection');
+  }
+  else if (/^1[-_\s]*(can|metal|aluminum)/i.test(className)) {
+    materialType = 'METAL_CAN';
+    threshold = CONFIG.detection.METAL_CAN;
+    hasStrongKeyword = true;
+    detectionFormat = 'variant_format';
+    log(`   ✅ Variant format detected: METAL_CAN`, 'detection');
+  }
+  // Priority 3: Legacy format support (fallback)
+  else if (className.includes('易拉罐') || className.includes('铝')) {
+    materialType = 'METAL_CAN';
+    threshold = CONFIG.detection.METAL_CAN;
+    hasStrongKeyword = true;
+    detectionFormat = 'legacy_chinese';
+    log(`   ✅ Legacy Chinese format detected: METAL_CAN`, 'detection');
   } 
-  else if (className.includes('pet') || className.includes('plastic') || 
-           className.includes('瓶') || className.includes('bottle')) {
+  else if (className.includes('pet') || className.includes('瓶')) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
     hasStrongKeyword = className.includes('pet');
-    log(`   ✅ Legacy format detected: PLASTIC_BOTTLE`, 'detection');
+    detectionFormat = 'legacy_keyword';
+    log(`   ✅ Legacy keyword format detected: PLASTIC_BOTTLE`, 'detection');
+  }
+  else if (className.includes('metal') || className.includes('can')) {
+    materialType = 'METAL_CAN';
+    threshold = CONFIG.detection.METAL_CAN;
+    hasStrongKeyword = false;
+    detectionFormat = 'legacy_keyword';
+    log(`   ✅ Legacy keyword format detected: METAL_CAN`, 'detection');
+  } 
+  else if (className.includes('plastic') || className.includes('bottle')) {
+    materialType = 'PLASTIC_BOTTLE';
+    threshold = CONFIG.detection.PLASTIC_BOTTLE;
+    hasStrongKeyword = false;
+    detectionFormat = 'legacy_keyword';
+    log(`   ✅ Legacy keyword format detected: PLASTIC_BOTTLE`, 'detection');
   } 
   else if (className.includes('玻璃') || className.includes('glass')) {
     materialType = 'GLASS';
     threshold = CONFIG.detection.GLASS;
     hasStrongKeyword = className.includes('玻璃');
-    log(`   ✅ Legacy format detected: GLASS`, 'detection');
+    detectionFormat = 'glass_detected';
+    log(`   ✅ Glass detected: GLASS`, 'detection');
   }
   
   const confidencePercent = Math.round(probability * 100);
   
   log(`   Material: ${materialType}`, 'detection');
+  log(`   Detection Format: ${detectionFormat}`, 'detection');
   log(`   Threshold: ${Math.round(threshold * 100)}%`, 'detection');
   log(`   Strong keyword: ${hasStrongKeyword}`, 'detection');
   
@@ -990,11 +1024,19 @@ function determineMaterialType(aiData) {
     return 'UNKNOWN';
   }
   
+  // Enhanced confidence checking
   if (materialType !== 'UNKNOWN' && probability < threshold) {
-    const relaxedThreshold = threshold * 0.3;
+    // New standard format gets more lenient threshold (they're very reliable)
+    const relaxedThreshold = detectionFormat === 'new_standard' ? threshold * 0.2 : threshold * 0.3;
     
     if (hasStrongKeyword && probability >= relaxedThreshold) {
       log(`   ✅ ACCEPTED via keyword (${confidencePercent}% >= ${Math.round(relaxedThreshold * 100)}%)`, 'success');
+      return materialType;
+    }
+    
+    // Special case: new standard format with decent confidence
+    if (detectionFormat === 'new_standard' && probability >= 0.15) {
+      log(`   ✅ ACCEPTED - New standard format with acceptable confidence (${confidencePercent}%)`, 'success');
       return materialType;
     }
     

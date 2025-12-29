@@ -79,7 +79,7 @@ const CONFIG = {
   retryDelay: 1500,
   maxRetries: 2,
   hasObjectSensor: false,
-  minValidWeight: 5,
+  minValidWeight: 2,
   minConfidenceRetry: 0.12  // Lowered from 0.15 for new format
 },
   
@@ -1697,22 +1697,9 @@ if (message.function === 'aiPhoto') {
   mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
   
   if (state.autoCycleEnabled && state.awaitingDetection) {
-    if (state.aiResult.materialType !== 'UNKNOWN') {
-      // Material detected successfully - proceed to get weight
-      state.detectionRetries = 0;
-      state.awaitingDetection = false;
-      
-      setTimeout(() => executeCommand('getWeight'), 300);
-      
-    } else {
-      // UNKNOWN material - REJECT IMMEDIATELY WITHOUT WEIGHT CHECK
-      log(`❌ UNKNOWN material detected - rejecting immediately (no weight check)`, 'warning');
-      state.awaitingDetection = false;
-      state.cycleInProgress = true;
-      
-      // Execute rejection immediately - no weight check needed
-      setTimeout(() => executeRejectionCycle(), 500);
-    }
+    // Always get weight first - for both known and unknown materials
+    state.awaitingDetection = false;
+    setTimeout(() => executeCommand('getWeight'), 300);
   }
   return;
 }
@@ -1799,22 +1786,12 @@ if (message.function === '06') {
   
   if (state.weight.weight > 0) state.calibrationAttempts = 0;
   
-  // Only process weight for KNOWN materials (UNKNOWN items are already rejected)
   if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
-    // Safety check: if somehow UNKNOWN material got here, reject it
-    if (state.aiResult.materialType === 'UNKNOWN') {
-      log(`⚠️ UNKNOWN material in weight handler - rejecting`, 'warning');
-      state.cycleInProgress = true;
-      setTimeout(() => executeRejectionCycle(), 500);
-      return;
-    }
-    
-    // Check weight for known materials
+    // Check if weight is too low - skip regardless of material type
     if (state.weight.weight < CONFIG.detection.minValidWeight) {
-      log(`Known material but weight too low (${state.weight.weight}g) - skipping`, 'crusher');
+      log(`Weight too low (${state.weight.weight}g) - skipping item`, 'crusher');
       state.aiResult = null;
       state.weight = null;
-      state.awaitingDetection = false;
       
       if (state.autoPhotoTimer) {
         clearTimeout(state.autoPhotoTimer);
@@ -1830,7 +1807,17 @@ if (message.function === '06') {
       return;
     }
     
-    // Material is known and weight is valid - accept it
+    // Weight is valid - now check material type
+    if (state.aiResult.materialType === 'UNKNOWN') {
+      // UNKNOWN material with valid weight - REJECT IT
+      log(`❌ UNKNOWN material with weight ${state.weight.weight}g - REJECTING`, 'warning');
+      state.cycleInProgress = true;
+      setTimeout(() => executeRejectionCycle(), 500);
+      return;
+    }
+    
+    // Known material with valid weight - ACCEPT IT
+    log(`✅ Known material (${state.aiResult.materialType}) with weight ${state.weight.weight}g - ACCEPTING`, 'success');
     state.cycleInProgress = true;
     setTimeout(() => executeAutoCycle(), 500);
   }

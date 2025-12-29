@@ -1682,75 +1682,73 @@ function connectWebSocket() {
         return;
       }
       
-      if (message.function === 'aiPhoto') {
-        const aiData = JSON.parse(message.data);
-        const materialType = determineMaterialType(aiData);
-        
-        state.aiResult = {
-          matchRate: Math.round((aiData.probability || 0) * 100),
-          materialType: materialType,
-          className: aiData.className,
-          taskId: aiData.taskId,
-          timestamp: new Date().toISOString()
-        };
-        
-        mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
-        
-        if (state.autoCycleEnabled && state.awaitingDetection) {
-          if (state.aiResult.materialType !== 'UNKNOWN') {
-            state.detectionRetries = 0;
-            state.awaitingDetection = false;
-            
-            setTimeout(() => executeCommand('getWeight'), 300);
-            
+     if (message.function === 'aiPhoto') {
+  const aiData = JSON.parse(message.data);
+  const materialType = determineMaterialType(aiData);
+  
+  state.aiResult = {
+    matchRate: Math.round((aiData.probability || 0) * 100),
+    materialType: materialType,
+    className: aiData.className,
+    taskId: aiData.taskId,
+    timestamp: new Date().toISOString()
+  };
+  
+  mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
+  
+  if (state.autoCycleEnabled && state.awaitingDetection) {
+    if (state.aiResult.materialType !== 'UNKNOWN') {
+      // Material detected successfully
+      state.detectionRetries = 0;
+      state.awaitingDetection = false;
+      
+      setTimeout(() => executeCommand('getWeight'), 300);
+      
+    } else {
+      // UNKNOWN material - REJECT IMMEDIATELY
+      log(`❌ UNKNOWN material detected - rejecting immediately`, 'warning');
+      state.awaitingDetection = false;
+      
+      setTimeout(async () => {
+        try {
+          // Check if there's actually an item on the belt
+          await executeCommand('getWeight');
+          await delay(CONFIG.timing.weightDelay + 500);
+          
+          if (state.weight && state.weight.weight >= CONFIG.detection.minValidWeight) {
+            // Item detected - execute rejection cycle immediately
+            log(`⚠️ Item weight: ${state.weight.weight}g - executing immediate rejection`, 'warning');
+            state.cycleInProgress = true;
+            setTimeout(() => executeRejectionCycle(), 500);
           } else {
-            state.detectionRetries++;
+            // No item or very light item - skip rejection
+            log('No significant item detected - skipping rejection', 'crusher');
+            state.aiResult = null;
+            state.weight = null;
+            state.detectionRetries = 0;
             
-            if (state.detectionRetries < CONFIG.detection.maxRetries) {
-              setTimeout(() => {
-                if (state.autoCycleEnabled) {
+            // Continue with next photo
+            if (state.autoCycleEnabled) {
+              state.autoPhotoTimer = setTimeout(() => {
+                if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+                  state.awaitingDetection = true;
                   executeCommand('takePhoto');
                 }
-              }, CONFIG.detection.retryDelay);
-            } else {
-              state.awaitingDetection = false;
-              
-              setTimeout(async () => {
-                try {
-                  await executeCommand('getWeight');
-                  await delay(CONFIG.timing.weightDelay + 500);
-                  
-                  if (state.weight && state.weight.weight >= CONFIG.detection.minValidWeight) {
-                    state.cycleInProgress = true;
-                    setTimeout(() => executeRejectionCycle(), 500);
-                  } else {
-                    log('No item detected - skipping rejection', 'crusher');
-                    state.aiResult = null;
-                    state.weight = null;
-                    state.detectionRetries = 0;
-                    
-                    if (state.autoCycleEnabled) {
-                      state.autoPhotoTimer = setTimeout(() => {
-                        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-                          state.awaitingDetection = true;
-                          executeCommand('takePhoto');
-                        }
-                      }, CONFIG.timing.autoPhotoDelay);
-                    }
-                  }
-                } catch (error) {
-                  log(`Weight check error: ${error.message}`, 'error');
-                  state.aiResult = null;
-                  state.weight = null;
-                  state.detectionRetries = 0;
-                  state.awaitingDetection = false;
-                }
-              }, 300);
+              }, CONFIG.timing.autoPhotoDelay);
             }
           }
+        } catch (error) {
+          log(`Weight check error: ${error.message}`, 'error');
+          state.aiResult = null;
+          state.weight = null;
+          state.detectionRetries = 0;
+          state.awaitingDetection = false;
         }
-        return;
-      }
+      }, 300);
+    }
+  }
+  return;
+}
       
       if (message.function === 'deviceStatus') {
         const binCode = parseInt(message.data);

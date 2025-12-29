@@ -1808,55 +1808,83 @@ function connectWebSocket() {
       }
       
       if (message.function === '06') {
-        const weightValue = parseFloat(message.data) || 0;
-        const coefficient = CONFIG.weight.coefficients[1];
-        const calibratedWeight = weightValue * (coefficient / 1000);
+  const weightValue = parseFloat(message.data) || 0;
+  const coefficient = CONFIG.weight.coefficients[1];
+  const calibratedWeight = weightValue * (coefficient / 1000);
+  
+  state.weight = {
+    weight: Math.round(calibratedWeight * 10) / 10,
+    rawWeight: weightValue,
+    coefficient: coefficient,
+    timestamp: new Date().toISOString()
+  };
+  
+  mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
+  
+  if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
+    state.calibrationAttempts++;
+    setTimeout(async () => {
+      await executeCommand('calibrateWeight');
+      setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
+    }, 500);
+    return;
+  }
+  
+  if (state.weight.weight > 0) state.calibrationAttempts = 0;
+  
+  if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
+    // 🚨 CHECK IF MATERIAL IS UNKNOWN - REJECT IT!
+    if (state.aiResult.materialType === 'UNKNOWN') {
+      if (state.weight.weight >= CONFIG.detection.minValidWeight) {
+        log(`❌ UNKNOWN material with weight ${state.weight.weight}g - REJECTING`, 'warning');
+        state.cycleInProgress = true;
+        setTimeout(() => executeRejectionCycle(), 500);
+      } else {
+        log('UNKNOWN material but weight too low - skipping', 'crusher');
+        state.aiResult = null;
+        state.weight = null;
+        state.awaitingDetection = false;
         
-        state.weight = {
-          weight: Math.round(calibratedWeight * 10) / 10,
-          rawWeight: weightValue,
-          coefficient: coefficient,
-          timestamp: new Date().toISOString()
-        };
-        
-        mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
-        
-        if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
-          state.calibrationAttempts++;
-          setTimeout(async () => {
-            await executeCommand('calibrateWeight');
-            setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
-          }, 500);
-          return;
+        if (state.autoPhotoTimer) {
+          clearTimeout(state.autoPhotoTimer);
         }
         
-        if (state.weight.weight > 0) state.calibrationAttempts = 0;
-        
-        if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
-          if (state.weight.weight < CONFIG.detection.minValidWeight) {
-            state.aiResult = null;
-            state.weight = null;
-            state.awaitingDetection = false;
-            
-            if (state.autoPhotoTimer) {
-              clearTimeout(state.autoPhotoTimer);
-            }
-            
-            state.autoPhotoTimer = setTimeout(() => {
-              if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-                state.awaitingDetection = true;
-                executeCommand('takePhoto');
-              }
-            }, CONFIG.timing.autoPhotoDelay);
-            
-            return;
+        state.autoPhotoTimer = setTimeout(() => {
+          if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+            state.awaitingDetection = true;
+            executeCommand('takePhoto');
           }
-          
-          state.cycleInProgress = true;
-          setTimeout(() => executeAutoCycle(), 500);
-        }
-        return;
+        }, CONFIG.timing.autoPhotoDelay);
       }
+      return;
+    }
+    
+    // Normal flow for known materials
+    if (state.weight.weight < CONFIG.detection.minValidWeight) {
+      state.aiResult = null;
+      state.weight = null;
+      state.awaitingDetection = false;
+      
+      if (state.autoPhotoTimer) {
+        clearTimeout(state.autoPhotoTimer);
+      }
+      
+      state.autoPhotoTimer = setTimeout(() => {
+        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+          state.awaitingDetection = true;
+          executeCommand('takePhoto');
+        }
+      }, CONFIG.timing.autoPhotoDelay);
+      
+      return;
+    }
+    
+    // Material is known and weight is valid - accept it
+    state.cycleInProgress = true;
+    setTimeout(() => executeAutoCycle(), 500);
+  }
+  return;
+}
       
     } catch (error) {
       log(`WS error: ${error.message}`, 'error');

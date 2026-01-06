@@ -1289,8 +1289,10 @@ async function executeAutoCycle() {
       // Use the same command but shorter delay since we're already partway there
       await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
       // Calculate remaining distance: total time minus already traveled distance
-      const remainingTime = Math.max(800, CONFIG.timing.beltToStepper - CONFIG.timing.beltToWeight);
+      // Use minimum 1200ms to ensure item fully reaches basket (800ms was too short)
+      const remainingTime = Math.max(1200, CONFIG.timing.beltToStepper - CONFIG.timing.beltToWeight);
       await delay(remainingTime);
+      log(`✅ Belt moved for ${remainingTime}ms (remaining distance)`, 'info');
     }
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
@@ -1398,12 +1400,17 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start automatic detection cycle after delay to allow user to place item
-    // This gives user time to place item, then system automatically starts processing
-    log('⚡ Session started - automatic detection will start in 3 seconds...', 'success');
-    await scheduleNextPhotoWithPositioning();
+    // Start automatic detection after delay to give user time to place bottle
+    // This delay allows: gate to open + user to place bottle
+    log('⚡ Session started - please place your bottle', 'success');
+    log('📸 Automatic detection will start in 2 seconds...', 'info');
     
-    log('✅ Detection cycle scheduled - ready for items!', 'success');
+    setTimeout(async () => {
+      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+        log('🎯 Starting detection cycle...', 'info');
+        await scheduleNextPhotoWithPositioning();
+      }
+    }, 2000); // 2 seconds: quick delay for user to place bottle
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1464,11 +1471,17 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start automatic detection cycle after delay to allow user to place item
-    log('⚡ Guest session started - automatic detection will start in 3 seconds...', 'success');
-    await scheduleNextPhotoWithPositioning();
+    // Start automatic detection after delay to give user time to place bottle
+    // This delay allows: gate to open + user to place bottle
+    log('⚡ Guest session started - please place your bottle', 'success');
+    log('📸 Automatic detection will start in 2 seconds...', 'info');
     
-    log('✅ Detection cycle scheduled - ready for items!', 'success');
+    setTimeout(async () => {
+      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+        log('🎯 Starting detection cycle...', 'info');
+        await scheduleNextPhotoWithPositioning();
+      }
+    }, 2000); // 2 seconds: quick delay for user to place bottle
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -2019,6 +2032,18 @@ mqttClient.on('message', async (topic, message) => {
           timestamp: new Date().toISOString()
         }));
         
+        return;
+      }
+      
+      // NEW: Start detection cycle (for first item or manual trigger)
+      if (payload.action === 'startDetectionCycle') {
+        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+          log('🎯 Manual trigger - starting detection cycle', 'info');
+          await scheduleNextPhotoWithPositioning();
+        } else {
+          log('⚠️ Cannot start detection - check state', 'warning');
+          log(`   autoCycle: ${state.autoCycleEnabled}, cycle: ${state.cycleInProgress}, awaiting: ${state.awaitingDetection}`, 'warning');
+        }
         return;
       }
       

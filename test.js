@@ -85,25 +85,25 @@ const CONFIG = {
   },
   
   timing: {
-    beltToWeight: 2500,
-    beltToStepper: 2800,
-    beltReverse: 4000,
-    stepperRotate: 2500,
-    stepperReset: 3500,
-    compactorCycle: 22000,
-    compactorIdleStop: 8000,
-    positionSettle: 300,
-    gateOperation: 800,
-    autoPhotoDelay: 2500,
-    sessionTimeout: 120000,
-    sessionMaxDuration: 600000,
-    weightDelay: 1200,
-    photoDelay: 1000,
-    calibrationDelay: 1000,
-    commandDelay: 100,
-    resetHomeDelay: 1200,
-    itemDropDelay: 800,
-    photoPositionDelay: 400  // NEW: Delay for item to settle at camera position
+    beltToWeight: 2500,           // Belt to camera/limit sensor position
+    beltToStepper: 2800,          // Belt to stepper/basket position (full distance)
+    beltReverse: 4000,            // Belt reverse for rejection
+    stepperRotate: 2500,          // Stepper rotation time
+    stepperReset: 3500,           // Stepper reset to home
+    compactorCycle: 22000,        // Compactor full cycle
+    compactorIdleStop: 8000,      // Stop compactor after 8s of no items
+    positionSettle: 300,          // Item settle time at position
+    gateOperation: 800,           // Gate open/close time
+    autoPhotoDelay: 2500,         // Delay before auto photo (after item placed)
+    sessionTimeout: 240000,       // 2 MINUTES - Inactivity timeout (no items placed)
+    sessionMaxDuration: 600000,   // 10 MINUTES - Maximum session duration
+    weightDelay: 1200,            // Delay after weight command
+    photoDelay: 1000,             // Delay after photo command
+    calibrationDelay: 1000,       // Delay after calibration
+    commandDelay: 100,            // Small delay between commands
+    resetHomeDelay: 1200,         // Stepper reset home delay
+    itemDropDelay: 800,           // Gravity drop delay
+    photoPositionDelay: 400       // Settle time at camera position
   },
   
   heartbeat: {
@@ -1279,14 +1279,18 @@ async function executeAutoCycle() {
     
     // If item was already positioned at camera (limit sensor), skip belt movement
     if (!state.itemAlreadyPositioned) {
-      log('⚡ Moving belt to stepper...', 'info');
+      log('⚡ Moving belt to stepper from start position...', 'info');
+      // Item not at camera - need full movement to stepper
       await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
       await delay(CONFIG.timing.beltToStepper);
     } else {
-      log('⚡ Item already at position - moving to stepper...', 'info');
-      // Item is at limit sensor, just need short movement to stepper
+      log('⚡ Item already at camera - moving remaining distance to stepper...', 'info');
+      // Item is at limit sensor (camera), just need the remaining distance
+      // Use the same command but shorter delay since we're already partway there
       await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
-      await delay(CONFIG.timing.beltToStepper - CONFIG.timing.beltToWeight); // Reduced time
+      // Calculate remaining distance: total time minus already traveled distance
+      const remainingTime = Math.max(800, CONFIG.timing.beltToStepper - CONFIG.timing.beltToWeight);
+      await delay(remainingTime);
     }
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
@@ -1394,10 +1398,10 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start detection cycle with positioning
-    await scheduleNextPhotoWithPositioning();
-    
-    log('⚡ Session started - with belt positioning for better detection!', 'success');
+    // DON'T start detection cycle immediately - wait for user to place item first
+    // The limit sensor or manual trigger will start the cycle
+    log('⚡ Session started - waiting for item placement...', 'success');
+    log('📸 System ready - belt will move when item is placed', 'info');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1458,10 +1462,9 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start detection cycle with positioning
-    await scheduleNextPhotoWithPositioning();
-    
-    log('⚡ Guest session started - with belt positioning for better detection!', 'success');
+    // DON'T start detection cycle immediately - wait for user to place item first
+    log('⚡ Guest session started - waiting for item placement...', 'success');
+    log('📸 System ready - belt will move when item is placed', 'info');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -2012,6 +2015,28 @@ mqttClient.on('message', async (topic, message) => {
           timestamp: new Date().toISOString()
         }));
         
+        return;
+      }
+      
+      // NEW: Manual trigger to start detection cycle
+      if (payload.action === 'startDetectionCycle') {
+        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+          log('🎯 Manual trigger - starting detection cycle', 'info');
+          await scheduleNextPhotoWithPositioning();
+        } else {
+          log('⚠️ Cannot start detection - cycle in progress or not in session', 'warning');
+        }
+        return;
+      }
+      
+      // NEW: Immediate photo trigger (without positioning, for testing)
+      if (payload.action === 'takePhotoNow') {
+        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+          log('📸 Immediate photo trigger', 'info');
+          state.awaitingDetection = true;
+          state.itemAlreadyPositioned = false;
+          await executeCommand('takePhoto');
+        }
         return;
       }
       

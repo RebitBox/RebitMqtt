@@ -95,7 +95,7 @@ const CONFIG = {
     positionSettle: 300,          // Item settle time at position
     gateOperation: 800,           // Gate open/close time
     autoPhotoDelay: 2500,         // Delay before auto photo (after item placed)
-    sessionTimeout: 240000,       // 2 MINUTES - Inactivity timeout (no items placed)
+    sessionTimeout: 120000,       // 2 MINUTES - Inactivity timeout (no items placed)
     sessionMaxDuration: 600000,   // 10 MINUTES - Maximum session duration
     weightDelay: 1200,            // Delay after weight command
     photoDelay: 1000,             // Delay after photo command
@@ -1398,10 +1398,12 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
     
-    // DON'T start detection cycle immediately - wait for user to place item first
-    // The limit sensor or manual trigger will start the cycle
-    log('⚡ Session started - waiting for item placement...', 'success');
-    log('📸 System ready - belt will move when item is placed', 'info');
+    // Start automatic detection cycle after delay to allow user to place item
+    // This gives user time to place item, then system automatically starts processing
+    log('⚡ Session started - automatic detection will start in 3 seconds...', 'success');
+    await scheduleNextPhotoWithPositioning();
+    
+    log('✅ Detection cycle scheduled - ready for items!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1462,9 +1464,11 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // DON'T start detection cycle immediately - wait for user to place item first
-    log('⚡ Guest session started - waiting for item placement...', 'success');
-    log('📸 System ready - belt will move when item is placed', 'info');
+    // Start automatic detection cycle after delay to allow user to place item
+    log('⚡ Guest session started - automatic detection will start in 3 seconds...', 'success');
+    await scheduleNextPhotoWithPositioning();
+    
+    log('✅ Detection cycle scheduled - ready for items!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');

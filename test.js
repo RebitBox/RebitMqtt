@@ -1,4 +1,4 @@
-// agent-qr-improved-detection-v3.js - WITH BELT POSITIONING BEFORE PHOTO
+// agent-qr-improved-detection-v3-fixed.js - PROPER BELT POSITIONING
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -81,29 +81,29 @@ const CONFIG = {
     hasObjectSensor: false,
     minValidWeight: 2,
     minConfidenceRetry: 0.12,
-    positionBeforePhoto: true  // NEW: Enable belt positioning before photo
+    positionBeforePhoto: true  // ENABLED: Always position at limit sensor before photo
   },
   
   timing: {
-    beltToWeight: 2500,           // Belt to camera/limit sensor position
-    beltToStepper: 2800,          // Belt to stepper/basket position (full distance)
-    beltReverse: 4000,            // Belt reverse for rejection
-    stepperRotate: 2500,          // Stepper rotation time
-    stepperReset: 3500,           // Stepper reset to home
-    compactorCycle: 22000,        // Compactor full cycle
-    compactorIdleStop: 8000,      // Stop compactor after 8s of no items
-    positionSettle: 300,          // Item settle time at position
-    gateOperation: 800,           // Gate open/close time
-    autoPhotoDelay: 2500,         // Delay before auto photo (after item placed)
-    sessionTimeout: 120000,       // 2 MINUTES - Inactivity timeout (no items placed)
-    sessionMaxDuration: 600000,   // 10 MINUTES - Maximum session duration
-    weightDelay: 1200,            // Delay after weight command
-    photoDelay: 1000,             // Delay after photo command
-    calibrationDelay: 1000,       // Delay after calibration
-    commandDelay: 100,            // Small delay between commands
-    resetHomeDelay: 1200,         // Stepper reset home delay
-    itemDropDelay: 800,           // Gravity drop delay
-    photoPositionDelay: 400       // Settle time at camera position
+    beltToWeight: 2500,        // Time to move belt to limit sensor (camera position)
+    beltToStepper: 2800,       // Time to move belt from limit sensor to stepper basket
+    beltReverse: 4000,
+    stepperRotate: 2500,
+    stepperReset: 3500,
+    compactorCycle: 22000,
+    compactorIdleStop: 8000,
+    positionSettle: 300,
+    gateOperation: 800,
+    autoPhotoDelay: 2500,
+    sessionTimeout: 120000,
+    sessionMaxDuration: 600000,
+    weightDelay: 1200,
+    photoDelay: 1000,
+    calibrationDelay: 1000,
+    commandDelay: 100,
+    resetHomeDelay: 1200,
+    itemDropDelay: 800,
+    photoPositionDelay: 400  // Delay for item to settle at camera position
   },
   
   heartbeat: {
@@ -165,7 +165,7 @@ const state = {
   detectionRetries: 0,
   awaitingDetection: false,
   resetting: false,
-  itemAlreadyPositioned: false,  // NEW: Track if item is already at camera position
+  itemAlreadyPositioned: false,  // Track if item is at limit sensor (camera position)
   
   // Bin status tracking
   binStatus: {
@@ -189,7 +189,7 @@ const state = {
     failures: 0,
     averageRetries: 0,
     lastSuccessfulTiming: null,
-    positioningHelped: 0  // NEW: Track if belt positioning improved detection
+    positioningHelped: 0
   }
 };
 
@@ -738,8 +738,9 @@ async function scheduleNextPhotoWithPositioning() {
       
       try {
         if (CONFIG.detection.positionBeforePhoto) {
-          // MANUFACTURER'S RECOMMENDATION: Position item at camera first
-          log('📸 Positioning item at limit sensor for better detection...', 'camera');
+          // MANUFACTURER'S RECOMMENDATION: Always move item to limit sensor (camera position) first
+          // This ensures consistent photo quality regardless of where user placed the item
+          log('📸 Moving belt to position item at limit sensor (camera)...', 'camera');
           
           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
           await delay(CONFIG.timing.beltToWeight);
@@ -748,7 +749,7 @@ async function scheduleNextPhotoWithPositioning() {
           await delay(CONFIG.timing.photoPositionDelay);
           
           state.itemAlreadyPositioned = true;
-          log('✅ Item positioned at camera - taking photo', 'camera');
+          log('✅ Item positioned at limit sensor - taking photo', 'camera');
         }
         
         await executeCommand('takePhoto');
@@ -1235,7 +1236,7 @@ async function executeRejectionCycle() {
 }
 
 // ============================================
-// AUTO CYCLE
+// AUTO CYCLE - FIXED BELT MOVEMENT
 // ============================================
 async function executeAutoCycle() {
   if (!state.aiResult || !state.weight || state.weight.weight <= 1) {
@@ -1267,7 +1268,7 @@ async function executeAutoCycle() {
   };
   
   console.log('\n' + '='.repeat(50));
-  console.log(`⚡ CYCLE #${state.itemsProcessed} - MAXIMUM SPEED`);
+  console.log(`⚡ CYCLE #${state.itemsProcessed} - COMPLETE BELT TRANSFER`);
   console.log(`   Material: ${cycleData.material}`);
   console.log(`   Weight: ${cycleData.weight}g`);
   console.log(`   Detection tries: ${state.detectionRetries + 1}`);
@@ -1277,42 +1278,34 @@ async function executeAutoCycle() {
   try {
     await startContinuousCompactor();
     
-    // If item was already positioned at camera (limit sensor), skip belt movement
-    if (!state.itemAlreadyPositioned) {
-      log('⚡ Moving belt to stepper from start position...', 'info');
-      // Item not at camera - need full movement to stepper
-      await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
-      await delay(CONFIG.timing.beltToStepper);
-    } else {
-      log('⚡ Item already at camera - moving remaining distance to stepper...', 'info');
-      // Item is at limit sensor (camera), just need the remaining distance
-      // Use the same command but shorter delay since we're already partway there
-      await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
-      // Calculate remaining distance: total time minus already traveled distance
-      // Use minimum 1200ms to ensure item fully reaches basket (800ms was too short)
-      const remainingTime = Math.max(1200, CONFIG.timing.beltToStepper - CONFIG.timing.beltToWeight);
-      await delay(remainingTime);
-      log(`✅ Belt moved for ${remainingTime}ms (remaining distance)`, 'info');
-    }
+    // MANUFACTURER'S SPEC: Item is now at limit sensor (camera position) after photo positioning
+    // ALWAYS complete FULL belt movement from limit sensor to stepper position
+    log('⚡ Moving belt from limit sensor to stepper basket (FULL cycle)...', 'info');
+    
+    await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
+    
+    // Use FULL toStepper timing to ensure complete transfer to basket
+    // This is the full distance from limit sensor (camera) to stepper basket
+    await delay(CONFIG.timing.beltToStepper);
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
-    log('✅ Belt stopped - item will drop by gravity', 'success');
+    log('✅ Belt stopped - item transferred to stepper basket', 'success');
 
     const targetPosition = cycleData.material === 'METAL_CAN' 
       ? CONFIG.motors.stepper.positions.metalCan
       : CONFIG.motors.stepper.positions.plasticBottle;
     
-    log(`🔄 Stepper → ${cycleData.material}...`, 'info');
+    log(`🔄 Stepper rotating to ${cycleData.material} position...`, 'info');
     await executeCommand('stepperMotor', { position: targetPosition });
     await delay(CONFIG.timing.stepperRotate);
 
-    log('⏳ Waiting for gravity drop...', 'info');
+    log('⏳ Waiting for gravity drop into bin...', 'info');
     await delay(CONFIG.timing.itemDropDelay);
 
-    log('🔄 Stepper → home...', 'info');
+    log('🔄 Stepper returning to home position...', 'info');
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
-    log('✅ Stepper at home', 'success');
+    log('✅ Stepper at home - ready for next item', 'success');
 
     log('🔨 Compactor crushing continuously...', 'crusher');
 
@@ -1400,17 +1393,10 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start automatic detection after delay to give user time to place bottle
-    // This delay allows: gate to open + user to place bottle
-    log('⚡ Session started - please place your bottle', 'success');
-    log('📸 Automatic detection will start in 2 seconds...', 'info');
+    // Start detection cycle with positioning
+    await scheduleNextPhotoWithPositioning();
     
-    setTimeout(async () => {
-      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        log('🎯 Starting detection cycle...', 'info');
-        await scheduleNextPhotoWithPositioning();
-      }
-    }, 2000); // 2 seconds: quick delay for user to place bottle
+    log('⚡ Session started - with belt positioning for better detection!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1471,17 +1457,10 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // Start automatic detection after delay to give user time to place bottle
-    // This delay allows: gate to open + user to place bottle
-    log('⚡ Guest session started - please place your bottle', 'success');
-    log('📸 Automatic detection will start in 2 seconds...', 'info');
+    // Start detection cycle with positioning
+    await scheduleNextPhotoWithPositioning();
     
-    setTimeout(async () => {
-      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        log('🎯 Starting detection cycle...', 'info');
-        await scheduleNextPhotoWithPositioning();
-      }
-    }, 2000); // 2 seconds: quick delay for user to place bottle
+    log('⚡ Guest session started - with belt positioning for better detection!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -2035,40 +2014,6 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
-      // NEW: Start detection cycle (for first item or manual trigger)
-      if (payload.action === 'startDetectionCycle') {
-        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-          log('🎯 Manual trigger - starting detection cycle', 'info');
-          await scheduleNextPhotoWithPositioning();
-        } else {
-          log('⚠️ Cannot start detection - check state', 'warning');
-          log(`   autoCycle: ${state.autoCycleEnabled}, cycle: ${state.cycleInProgress}, awaiting: ${state.awaitingDetection}`, 'warning');
-        }
-        return;
-      }
-      
-      // NEW: Manual trigger to start detection cycle
-      if (payload.action === 'startDetectionCycle') {
-        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-          log('🎯 Manual trigger - starting detection cycle', 'info');
-          await scheduleNextPhotoWithPositioning();
-        } else {
-          log('⚠️ Cannot start detection - cycle in progress or not in session', 'warning');
-        }
-        return;
-      }
-      
-      // NEW: Immediate photo trigger (without positioning, for testing)
-      if (payload.action === 'takePhotoNow') {
-        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-          log('📸 Immediate photo trigger', 'info');
-          state.awaitingDetection = true;
-          state.itemAlreadyPositioned = false;
-          await executeCommand('takePhoto');
-        }
-        return;
-      }
-      
       if (state.moduleId) {
         await executeCommand(payload.action, payload.params);
       }
@@ -2154,16 +2099,16 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(60));
-console.log('🚀 RVM AGENT V3 - IMPROVED DETECTION WITH POSITIONING');
+console.log('🚀 RVM AGENT V3 - FIXED BELT POSITIONING');
 console.log('='.repeat(60));
 console.log(`📱 Device: ${CONFIG.device.id}`);
 console.log('✅ Gate stays open during session!');
 console.log('🔨 Compactor runs continuously!');
 console.log('⚡ Items drop by gravity!');
-console.log('📸 Belt positioning before AI photo!');
-console.log('🎯 Enhanced material detection!');
+console.log('📸 Belt positioning: ALWAYS move to limit sensor first!');
+console.log('🎯 Then FULL belt movement to stepper basket!');
 console.log('📊 Detection analytics with positioning stats!');
 console.log('💊 Auto-healing QR scanner!');
 console.log('='.repeat(60) + '\n');
 
-log('🚀 Starting agent with manufacturer-recommended positioning...', 'info');
+log('🚀 Starting agent with proper belt positioning...', 'info');

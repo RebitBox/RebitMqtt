@@ -73,38 +73,39 @@ const CONFIG = {
   },
   
   detection: {
-    METAL_CAN: 0.20,
-    PLASTIC_BOTTLE: 0.25,
-    GLASS: 0.25,
-    retryDelay: 1500,
-    maxRetries: 2,
-    hasObjectSensor: false,
-    minValidWeight: 2,
-    minConfidenceRetry: 0.12,
-    positionBeforePhoto: true  // ENABLED: Always position at limit sensor before photo
-  },
+  METAL_CAN: 0.65,           // 65% confidence threshold (was 0.20)
+  PLASTIC_BOTTLE: 0.65,      // 65% confidence threshold (was 0.25)
+  GLASS: 0.65,               // 65% confidence threshold (was 0.25)
+  retryDelay: 1500,
+  maxRetries: 2,
+  hasObjectSensor: false,
+  minValidWeight: 2,
+  minConfidenceRetry: 0.50,  // 50% - triggers retry (was 0.12)
+  positionBeforePhoto: true
+},
+
   
-  timing: {
-    beltToWeight: 2500,        // Time to move belt to limit sensor (camera position)
-    beltToStepper: 2800,       // Time to move belt from limit sensor to stepper basket
-    beltReverse: 4000,
-    stepperRotate: 2500,
-    stepperReset: 3500,
-    compactorCycle: 22000,
-    compactorIdleStop: 8000,
-    positionSettle: 300,
-    gateOperation: 800,
-    autoPhotoDelay: 2500,
-    sessionTimeout: 120000,
-    sessionMaxDuration: 600000,
-    weightDelay: 1200,
-    photoDelay: 1000,
-    calibrationDelay: 1000,
-    commandDelay: 100,
-    resetHomeDelay: 1200,
-    itemDropDelay: 800,
-    photoPositionDelay: 400  // Delay for item to settle at camera position
-  },
+timing: {
+  beltToWeight: 2500,        // ⚡ Reduce to 2000-2200ms (camera position)
+  beltToStepper: 2800,       // ⚡ Reduce to 2300-2500ms (to basket)
+  beltReverse: 4000,         // Keep as is (rejection)
+  stepperRotate: 2500,       // ⚡ Reduce to 2000-2200ms (bin rotation)
+  stepperReset: 3500,        // ⚡ Reduce to 2800-3000ms (return home)
+  compactorCycle: 22000,     // Not used in continuous mode
+  compactorIdleStop: 8000,   // ⚡ Reduce to 6000ms (faster compactor stop)
+  positionSettle: 300,       // Keep as is
+  gateOperation: 800,        // Keep as is
+  autoPhotoDelay: 2500,      // ⚡ CRITICAL: Reduce to 1800-2000ms (faster detection)
+  sessionTimeout: 120000,    // Keep as is
+  sessionMaxDuration: 600000,// Keep as is
+  weightDelay: 1200,         // ⚡ Reduce to 800-1000ms
+  photoDelay: 1000,          // ⚡ Reduce to 600-800ms
+  calibrationDelay: 1000,    // Keep as is
+  commandDelay: 100,         // Keep as is
+  resetHomeDelay: 1200,      // Keep as is
+  itemDropDelay: 800,        // ⚡ Reduce to 500-600ms (gravity drop)
+  photoPositionDelay: 400    // ⚡ Reduce to 200-300ms (settle time)
+},
   
   heartbeat: {
     interval: 30,
@@ -1084,10 +1085,11 @@ function determineMaterialType(aiData) {
     return 'UNKNOWN';
   }
   
-  // Enhanced confidence checking
-  if (materialType !== 'UNKNOWN' && probability < threshold) {
-    // New standard format gets more lenient threshold (they're very reliable)
-    const relaxedThreshold = detectionFormat === 'new_standard' ? threshold * 0.2 : threshold * 0.3;
+  // Enhanced confidence checking with 65% base threshold
+if (materialType !== 'UNKNOWN' && probability < threshold) {
+  // New standard format gets more lenient threshold (they're very reliable)
+  const relaxedThreshold = detectionFormat === 'new_standard' ? threshold * 0.70 : threshold * 0.80;
+  // This means: 45.5% for new_standard format, 52% for others
     
     if (hasStrongKeyword && probability >= relaxedThreshold) {
       log(`   ✅ ACCEPTED via keyword (${confidencePercent}% >= ${Math.round(relaxedThreshold * 100)}%)`, 'success');
@@ -1095,7 +1097,7 @@ function determineMaterialType(aiData) {
     }
     
     // Special case: new standard format with decent confidence
-    if (detectionFormat === 'new_standard' && probability >= 0.15) {
+    if (detectionFormat === 'new_standard' && probability >= 0.45) {
       log(`   ✅ ACCEPTED - New standard format with acceptable confidence (${confidencePercent}%)`, 'success');
       return materialType;
     }

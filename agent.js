@@ -1,4 +1,4 @@
-// agent-qr-ultra-reliable-optimized-v2.js - EXACT TIMINGS FROM V1
+// agent-qr-improved-detection-v3-fixed.js - PROPER BELT POSITIONING
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -6,7 +6,7 @@ const WebSocket = require('ws');
 const { GlobalKeyboardListener } = require('node-global-key-listener');
 
 // ============================================
-// CONFIGURATION - EXACT TIMINGS FROM V1
+// CONFIGURATION
 // ============================================
 const CONFIG = {
   device: {
@@ -73,36 +73,38 @@ const CONFIG = {
   },
   
   detection: {
-  METAL_CAN: 0.20,      // Lowered from 0.22
-  PLASTIC_BOTTLE: 0.25, // Lowered from 0.30
-  GLASS: 0.25,
+  METAL_CAN: 0.65,           // 65% confidence threshold (was 0.20)
+  PLASTIC_BOTTLE: 0.65,      // 65% confidence threshold (was 0.25)
+  GLASS: 0.65,               // 65% confidence threshold (was 0.25)
   retryDelay: 1500,
   maxRetries: 2,
   hasObjectSensor: false,
-  minValidWeight: 2,
-  minConfidenceRetry: 0.12  // Lowered from 0.15 for new format
+  minConfidenceRetry: 0.50,  // 50% - triggers retry (was 0.12)
+  positionBeforePhoto: true
 },
+
   
-  timing: {
-    beltToWeight: 2500,
-    beltToStepper: 2800,
-    beltReverse: 4000,
-    stepperRotate: 2500,
-    stepperReset: 3500,
-    compactorCycle: 22000,
-    compactorIdleStop: 8000,
-    positionSettle: 300,
-    gateOperation: 800,
-    autoPhotoDelay: 2500,
-    sessionTimeout: 120000,
-    sessionMaxDuration: 600000,
-    weightDelay: 1200,
-    photoDelay: 1000,
-    calibrationDelay: 1000,
-    commandDelay: 100,
-    resetHomeDelay: 1200,
-    itemDropDelay: 800
-  },
+timing: {
+  beltToWeight: 2500,        // ⚡ Reduce to 2000-2200ms (camera position)
+  beltToStepper: 2800,       // ⚡ Reduce to 2300-2500ms (to basket)
+  beltReverse: 4000,         // Keep as is (rejection)
+  stepperRotate: 2500,       // ⚡ Reduce to 2000-2200ms (bin rotation)
+  stepperReset: 3500,        // ⚡ Reduce to 2800-3000ms (return home)
+  compactorCycle: 22000,     // Not used in continuous mode
+  compactorIdleStop: 8000,   // ⚡ Reduce to 6000ms (faster compactor stop)
+  positionSettle: 300,       // Keep as is
+  gateOperation: 800,        // Keep as is
+  autoPhotoDelay: 2500,      // ⚡ CRITICAL: Reduce to 1800-2000ms (faster detection)
+  sessionTimeout: 120000,    // Keep as is
+  sessionMaxDuration: 600000,// Keep as is
+  weightDelay: 1200,         // ⚡ Reduce to 800-1000ms
+  photoDelay: 1000,          // ⚡ Reduce to 600-800ms
+  calibrationDelay: 1000,    // Keep as is
+  commandDelay: 100,         // Keep as is
+  resetHomeDelay: 1200,      // Keep as is
+  itemDropDelay: 800,        // ⚡ Reduce to 500-600ms (gravity drop)
+  photoPositionDelay: 400    // ⚡ Reduce to 200-300ms (settle time)
+},
   
   heartbeat: {
     interval: 30,
@@ -163,6 +165,7 @@ const state = {
   detectionRetries: 0,
   awaitingDetection: false,
   resetting: false,
+  itemAlreadyPositioned: false,  // Track if item is at limit sensor (camera position)
   
   // Bin status tracking
   binStatus: {
@@ -185,7 +188,8 @@ const state = {
     thirdTimeSuccess: 0,
     failures: 0,
     averageRetries: 0,
-    lastSuccessfulTiming: null
+    lastSuccessfulTiming: null,
+    positioningHelped: 0
   }
 };
 
@@ -287,6 +291,7 @@ function logDetectionStats() {
   log(`Third Time Success: ${stats.thirdTimeSuccess}`, 'detection');
   log(`Failures: ${stats.failures}`, 'detection');
   log(`Average Retries: ${stats.averageRetries.toFixed(2)}`, 'detection');
+  log(`Positioning Helped: ${stats.positioningHelped} times`, 'detection');
   log('='.repeat(60) + '\n', 'detection');
 }
 
@@ -718,6 +723,57 @@ async function stopCompactor() {
 }
 
 // ============================================
+// IMPROVED PHOTO DETECTION WITH POSITIONING
+// ============================================
+
+async function scheduleNextPhotoWithPositioning() {
+  if (state.autoPhotoTimer) {
+    clearTimeout(state.autoPhotoTimer);
+  }
+  
+  state.autoPhotoTimer = setTimeout(async () => {
+    if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+      state.awaitingDetection = true;
+      state.itemAlreadyPositioned = false;
+      
+      try {
+        if (CONFIG.detection.positionBeforePhoto) {
+          // MANUFACTURER'S RECOMMENDATION: Always move item to limit sensor (camera position) first
+          // This ensures consistent photo quality regardless of where user placed the item
+          log('📸 Moving belt to position item at limit sensor (camera)...', 'camera');
+          
+          await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
+          await delay(CONFIG.timing.beltToWeight);
+          
+          await executeCommand('customMotor', CONFIG.motors.belt.stop);
+          await delay(CONFIG.timing.photoPositionDelay);
+          
+          state.itemAlreadyPositioned = true;
+          log('✅ Item positioned at limit sensor - taking photo', 'camera');
+        }
+        
+        await executeCommand('takePhoto');
+        
+      } catch (error) {
+        log(`Photo positioning error: ${error.message}`, 'error');
+        state.awaitingDetection = false;
+        state.itemAlreadyPositioned = false;
+        
+        // Retry without positioning on error
+        if (state.autoCycleEnabled) {
+          setTimeout(async () => {
+            if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+              state.awaitingDetection = true;
+              await executeCommand('takePhoto');
+            }
+          }, CONFIG.timing.autoPhotoDelay);
+        }
+      }
+    }
+  }, CONFIG.timing.autoPhotoDelay);
+}
+
+// ============================================
 // HEALTH CHECKS
 // ============================================
 
@@ -910,6 +966,10 @@ function runDiagnostics() {
   console.log(`   Last item: ${state.lastItemTime ? Math.round((Date.now() - state.lastItemTime)/1000) + 's ago' : 'N/A'}`);
   console.log(`   Idle timer: ${state.compactorIdleTimer ? '⏰ ACTIVE' : '❌ NONE'}`);
   
+  console.log('\n📸 Detection:');
+  console.log(`   Position before photo: ${CONFIG.detection.positionBeforePhoto ? '✅ ENABLED' : '❌ DISABLED'}`);
+  console.log(`   Item positioned: ${state.itemAlreadyPositioned ? '✅ YES' : '❌ NO'}`);
+  
   console.log('\n🗑️ Bin Status:');
   console.log(`   Plastic (Left): ${state.binStatus.plastic ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Metal (Middle): ${state.binStatus.metal ? '❌ FULL' : '✅ OK'}`);
@@ -929,7 +989,7 @@ function runDiagnostics() {
 }
 
 // ============================================
-// MATERIAL TYPE DETECTION - IMPROVED VERSION
+// MATERIAL TYPE DETECTION
 // ============================================
 function determineMaterialType(aiData) {
   const className = (aiData.className || '').toLowerCase().trim();
@@ -1024,10 +1084,11 @@ function determineMaterialType(aiData) {
     return 'UNKNOWN';
   }
   
-  // Enhanced confidence checking
-  if (materialType !== 'UNKNOWN' && probability < threshold) {
-    // New standard format gets more lenient threshold (they're very reliable)
-    const relaxedThreshold = detectionFormat === 'new_standard' ? threshold * 0.2 : threshold * 0.3;
+  // Enhanced confidence checking with 65% base threshold
+if (materialType !== 'UNKNOWN' && probability < threshold) {
+  // New standard format gets more lenient threshold (they're very reliable)
+  const relaxedThreshold = detectionFormat === 'new_standard' ? threshold * 0.70 : threshold * 0.80;
+  // This means: 45.5% for new_standard format, 52% for others
     
     if (hasStrongKeyword && probability >= relaxedThreshold) {
       log(`   ✅ ACCEPTED via keyword (${confidencePercent}% >= ${Math.round(relaxedThreshold * 100)}%)`, 'success');
@@ -1035,7 +1096,7 @@ function determineMaterialType(aiData) {
     }
     
     // Special case: new standard format with decent confidence
-    if (detectionFormat === 'new_standard' && probability >= 0.15) {
+    if (detectionFormat === 'new_standard' && probability >= 0.45) {
       log(`   ✅ ACCEPTED - New standard format with acceptable confidence (${confidencePercent}%)`, 'success');
       return materialType;
     }
@@ -1168,26 +1229,18 @@ async function executeRejectionCycle() {
   state.detectionRetries = 0;
   state.awaitingDetection = false;
   state.cycleInProgress = false;
+  state.itemAlreadyPositioned = false;
 
   if (state.autoCycleEnabled) {
-    if (state.autoPhotoTimer) {
-      clearTimeout(state.autoPhotoTimer);
-    }
-    
-    state.autoPhotoTimer = setTimeout(() => {
-      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        state.awaitingDetection = true;
-        executeCommand('takePhoto');
-      }
-    }, CONFIG.timing.autoPhotoDelay);
+    await scheduleNextPhotoWithPositioning();
   }
 }
 
 // ============================================
-// AUTO CYCLE
+// AUTO CYCLE - NO MINIMUM WEIGHT CHECK
 // ============================================
 async function executeAutoCycle() {
-  if (!state.aiResult || !state.weight || state.weight.weight <= 1) {
+  if (!state.aiResult || !state.weight) {
     state.cycleInProgress = false;
     return;
   }
@@ -1197,6 +1250,12 @@ async function executeAutoCycle() {
   
   trackDetectionAttempt(true, state.detectionRetries);
   
+  // Track if positioning helped improve detection
+  if (state.itemAlreadyPositioned && state.detectionRetries > 0) {
+    state.detectionStats.positioningHelped++;
+    log('📸 Belt positioning improved detection!', 'success');
+  }
+  
   const cycleData = {
     deviceId: CONFIG.device.id,
     material: state.aiResult.materialType,
@@ -1205,41 +1264,49 @@ async function executeAutoCycle() {
     sessionCode: state.sessionCode,
     itemNumber: state.itemsProcessed,
     detectionRetries: state.detectionRetries,
+    itemWasPositioned: state.itemAlreadyPositioned,
     timestamp: new Date().toISOString()
   };
   
   console.log('\n' + '='.repeat(50));
-  console.log(`⚡ CYCLE #${state.itemsProcessed} - MAXIMUM SPEED`);
+  console.log(`⚡ CYCLE #${state.itemsProcessed} - COMPLETE BELT TRANSFER`);
   console.log(`   Material: ${cycleData.material}`);
   console.log(`   Weight: ${cycleData.weight}g`);
   console.log(`   Detection tries: ${state.detectionRetries + 1}`);
+  console.log(`   Positioned: ${state.itemAlreadyPositioned ? 'YES' : 'NO'}`);
   console.log('='.repeat(50) + '\n');
 
   try {
     await startContinuousCompactor();
     
-    log('⚡ Moving belt to stepper...', 'info');
+    // MANUFACTURER'S SPEC: Item is now at limit sensor (camera position) after photo positioning
+    // ALWAYS complete FULL belt movement from limit sensor to stepper position
+    log('⚡ Moving belt from limit sensor to stepper basket (FULL cycle)...', 'info');
+    
     await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
+    
+    // Use FULL toStepper timing to ensure complete transfer to basket
+    // This is the full distance from limit sensor (camera) to stepper basket
     await delay(CONFIG.timing.beltToStepper);
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
-    log('✅ Belt stopped - item will drop by gravity', 'success');
+    log('✅ Belt stopped - item transferred to stepper basket', 'success');
 
     const targetPosition = cycleData.material === 'METAL_CAN' 
       ? CONFIG.motors.stepper.positions.metalCan
       : CONFIG.motors.stepper.positions.plasticBottle;
     
-    log(`🔄 Stepper → ${cycleData.material}...`, 'info');
+    log(`🔄 Stepper rotating to ${cycleData.material} position...`, 'info');
     await executeCommand('stepperMotor', { position: targetPosition });
     await delay(CONFIG.timing.stepperRotate);
 
-    log('⏳ Waiting for gravity drop...', 'info');
+    log('⏳ Waiting for gravity drop into bin...', 'info');
     await delay(CONFIG.timing.itemDropDelay);
 
-    log('🔄 Stepper → home...', 'info');
+    log('🔄 Stepper returning to home position...', 'info');
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
-    log('✅ Stepper at home', 'success');
+    log('✅ Stepper at home - ready for next item', 'success');
 
     log('🔨 Compactor crushing continuously...', 'crusher');
 
@@ -1257,18 +1324,10 @@ async function executeAutoCycle() {
   state.cycleInProgress = false;
   state.detectionRetries = 0;
   state.awaitingDetection = false;
+  state.itemAlreadyPositioned = false;
 
   if (state.autoCycleEnabled) {
-    if (state.autoPhotoTimer) {
-      clearTimeout(state.autoPhotoTimer);
-    }
-    
-    state.autoPhotoTimer = setTimeout(() => {
-      if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-        state.awaitingDetection = true;
-        executeCommand('takePhoto');
-      }
-    }, CONFIG.timing.autoPhotoDelay);
+    await scheduleNextPhotoWithPositioning();
   }
 }
 
@@ -1277,7 +1336,7 @@ async function executeAutoCycle() {
 // ============================================
 async function startMemberSession(validationData) {
   console.log('\n' + '='.repeat(50));
-  console.log('🎬 MEMBER SESSION START - MAXIMUM SPEED MODE');
+  console.log('🎬 MEMBER SESSION START - WITH IMPROVED DETECTION');
   console.log('='.repeat(50));
   
   try {
@@ -1335,18 +1394,10 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
     
-    if (state.autoPhotoTimer) {
-      clearTimeout(state.autoPhotoTimer);
-    }
+    // Start detection cycle with positioning
+    await scheduleNextPhotoWithPositioning();
     
-    state.autoPhotoTimer = setTimeout(() => {
-      if (state.autoCycleEnabled) {
-        state.awaitingDetection = true;
-        executeCommand('takePhoto');
-      }
-    }, CONFIG.timing.autoPhotoDelay);
-    
-    log('⚡ Session started - Maximum speed mode!', 'success');
+    log('⚡ Session started - with belt positioning for better detection!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1357,7 +1408,7 @@ async function startMemberSession(validationData) {
 
 async function startGuestSession(sessionData) {
   console.log('\n' + '='.repeat(50));
-  console.log('🎬 GUEST SESSION START - MAXIMUM SPEED MODE');
+  console.log('🎬 GUEST SESSION START - WITH IMPROVED DETECTION');
   console.log('='.repeat(50));
   
   try {
@@ -1407,18 +1458,10 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    if (state.autoPhotoTimer) {
-      clearTimeout(state.autoPhotoTimer);
-    }
+    // Start detection cycle with positioning
+    await scheduleNextPhotoWithPositioning();
     
-    state.autoPhotoTimer = setTimeout(() => {
-      if (state.autoCycleEnabled) {
-        state.awaitingDetection = true;
-        executeCommand('takePhoto');
-      }
-    }, CONFIG.timing.autoPhotoDelay);
-    
-    log('⚡ Guest session started - Maximum speed mode!', 'success');
+    log('⚡ Guest session started - with belt positioning for better detection!', 'success');
     
   } catch (error) {
     log(`❌ Session start error: ${error.message}`, 'error');
@@ -1500,6 +1543,7 @@ async function resetSystemForNextUser(forceStop = false) {
     state.isMember = false;
     state.isGuestSession = false;
     state.lastItemTime = null;
+    state.itemAlreadyPositioned = false;
     
     clearSessionTimers();
     clearQRProcessing();
@@ -1658,7 +1702,7 @@ function connectWebSocket() {
         if (!state.isReady) {
           state.isReady = true;
           log('========================================');
-          log('🟢 SYSTEM READY - MAXIMUM SPEED MODE');
+          log('🟢 SYSTEM READY - WITH IMPROVED DETECTION');
           log('========================================');
           
           setupQRScanner();
@@ -1682,27 +1726,27 @@ function connectWebSocket() {
         return;
       }
       
-if (message.function === 'aiPhoto') {
-  const aiData = JSON.parse(message.data);
-  const materialType = determineMaterialType(aiData);
-  
-  state.aiResult = {
-    matchRate: Math.round((aiData.probability || 0) * 100),
-    materialType: materialType,
-    className: aiData.className,
-    taskId: aiData.taskId,
-    timestamp: new Date().toISOString()
-  };
-  
-  mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
-  
-  if (state.autoCycleEnabled && state.awaitingDetection) {
-    // Always get weight first - for both known and unknown materials
-    state.awaitingDetection = false;
-    setTimeout(() => executeCommand('getWeight'), 300);
-  }
-  return;
-}
+      if (message.function === 'aiPhoto') {
+        const aiData = JSON.parse(message.data);
+        const materialType = determineMaterialType(aiData);
+        
+        state.aiResult = {
+          matchRate: Math.round((aiData.probability || 0) * 100),
+          materialType: materialType,
+          className: aiData.className,
+          taskId: aiData.taskId,
+          timestamp: new Date().toISOString()
+        };
+        
+        mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
+        
+        if (state.autoCycleEnabled && state.awaitingDetection) {
+          // Always get weight first - for both known and unknown materials
+          state.awaitingDetection = false;
+          setTimeout(() => executeCommand('getWeight'), 300);
+        }
+        return;
+      }
       
       if (message.function === 'deviceStatus') {
         const binCode = parseInt(message.data);
@@ -1761,68 +1805,48 @@ if (message.function === 'aiPhoto') {
         return;
       }
       
-if (message.function === '06') {
-  const weightValue = parseFloat(message.data) || 0;
-  const coefficient = CONFIG.weight.coefficients[1];
-  const calibratedWeight = weightValue * (coefficient / 1000);
-  
-  state.weight = {
-    weight: Math.round(calibratedWeight * 10) / 10,
-    rawWeight: weightValue,
-    coefficient: coefficient,
-    timestamp: new Date().toISOString()
-  };
-  
-  mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
-  
-  if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
-    state.calibrationAttempts++;
-    setTimeout(async () => {
-      await executeCommand('calibrateWeight');
-      setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
-    }, 500);
-    return;
-  }
-  
-  if (state.weight.weight > 0) state.calibrationAttempts = 0;
-  
-  if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
-    // Check if weight is too low - skip regardless of material type
-    if (state.weight.weight < CONFIG.detection.minValidWeight) {
-      log(`Weight too low (${state.weight.weight}g) - skipping item`, 'crusher');
-      state.aiResult = null;
-      state.weight = null;
-      
-      if (state.autoPhotoTimer) {
-        clearTimeout(state.autoPhotoTimer);
-      }
-      
-      state.autoPhotoTimer = setTimeout(() => {
-        if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-          state.awaitingDetection = true;
-          executeCommand('takePhoto');
+      if (message.function === '06') {
+        const weightValue = parseFloat(message.data) || 0;
+        const coefficient = CONFIG.weight.coefficients[1];
+        const calibratedWeight = weightValue * (coefficient / 1000);
+        
+        state.weight = {
+          weight: Math.round(calibratedWeight * 10) / 10,
+          rawWeight: weightValue,
+          coefficient: coefficient,
+          timestamp: new Date().toISOString()
+        };
+        
+        mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
+        
+        if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
+          state.calibrationAttempts++;
+          setTimeout(async () => {
+            await executeCommand('calibrateWeight');
+            setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
+          }, 500);
+          return;
         }
-      }, CONFIG.timing.autoPhotoDelay);
-      
-      return;
-    }
-    
-    // Weight is valid - now check material type
-    if (state.aiResult.materialType === 'UNKNOWN') {
-      // UNKNOWN material with valid weight - REJECT IT
-      log(`❌ UNKNOWN material with weight ${state.weight.weight}g - REJECTING`, 'warning');
-      state.cycleInProgress = true;
-      setTimeout(() => executeRejectionCycle(), 500);
-      return;
-    }
-    
-    // Known material with valid weight - ACCEPT IT
-    log(`✅ Known material (${state.aiResult.materialType}) with weight ${state.weight.weight}g - ACCEPTING`, 'success');
-    state.cycleInProgress = true;
-    setTimeout(() => executeAutoCycle(), 500);
-  }
-  return;
-}
+        
+        if (state.weight.weight > 0) state.calibrationAttempts = 0;
+        
+        if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
+          // No minimum weight check - just check material type
+          if (state.aiResult.materialType === 'UNKNOWN') {
+            // UNKNOWN material - REJECT IT
+            log(`❌ UNKNOWN material with weight ${state.weight.weight}g - REJECTING`, 'warning');
+            state.cycleInProgress = true;
+            setTimeout(() => executeRejectionCycle(), 500);
+            return;
+          }
+          
+          // Known material - ACCEPT IT (no weight check)
+          log(`✅ Known material (${state.aiResult.materialType}) with weight ${state.weight.weight}g - ACCEPTING`, 'success');
+          state.cycleInProgress = true;
+          setTimeout(() => executeAutoCycle(), 500);
+        }
+        return;
+      }
       
     } catch (error) {
       log(`WS error: ${error.message}`, 'error');
@@ -2065,21 +2089,17 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(60));
-console.log('🚀 RVM AGENT V2 - MAXIMUM SPEED WITH IMPROVED DETECTION');
+console.log('🚀 RVM AGENT V3 - NO MINIMUM WEIGHT CHECK');
 console.log('='.repeat(60));
 console.log(`📱 Device: ${CONFIG.device.id}`);
 console.log('✅ Gate stays open during session!');
 console.log('🔨 Compactor runs continuously!');
-console.log('⚡ No belt reverse for accepted items!');
 console.log('⚡ Items drop by gravity!');
-console.log('🎯 Enhanced material detection!');
-console.log('📊 Detection analytics tracking!');
+console.log('📸 Belt positioning: ALWAYS move to limit sensor first!');
+console.log('🎯 Then FULL belt movement to stepper basket!');
+console.log('⚖️ NO MINIMUM WEIGHT - All items accepted!');
+console.log('📊 Detection analytics with positioning stats!');
 console.log('💊 Auto-healing QR scanner!');
 console.log('='.repeat(60) + '\n');
 
-log('🚀 Starting optimized agent with v1 timings...', 'info');
-
-
-
-
-
+log('🚀 Starting agent with no minimum weight check...', 'info');

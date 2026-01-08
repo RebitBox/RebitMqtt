@@ -1137,7 +1137,7 @@ async function executeCommand(action, params = {}) {
       
     case 'closeGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
-      apiPayload = { moduleId: state.moduleId, motorId: '01', type: '00', deviceType };
+      apiPayload = { moduleId: state.moduleId, motorId: '01', type: '01', deviceType };
       break;
       
     case 'getWeight':

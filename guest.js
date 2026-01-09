@@ -83,7 +83,7 @@ const CONFIG = {
     compactorIdleStop: 8000,
     positionSettle: 300,
     gateOperation: 800,
-    autoPhotoDelay: 2500,
+    autoPhotoDelay: 2500,  // 2.5 seconds for subsequent items
     sessionTimeout: 120000,
     sessionMaxDuration: 600000,
     weightDelay: 1200,
@@ -869,6 +869,8 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
+    // ⚡ Wait 4 seconds after gate opens before first photo cycle
+    await delay(4000);
     await scheduleNextPhotoWithPositioning();
     
     log('✅ Guest session active', 'success');
@@ -888,13 +890,15 @@ async function resetSystemForNextUser(forceStop = false) {
   log('🔄 Resetting system', 'info');
   state.resetting = true;
   
+  // ⚡ Close gate IMMEDIATELY when session ends
   try {
-    try {
-      await executeCommand('closeGate');
-    } catch (error) {
-      log(`Gate close error: ${error.message}`, 'error');
-    }
-    
+    await executeCommand('closeGate');
+    log('🚪 Gate closed', 'info');
+  } catch (error) {
+    log(`Gate close error: ${error.message}`, 'error');
+  }
+  
+  try {
     state.autoCycleEnabled = false;
     state.awaitingDetection = false;
     

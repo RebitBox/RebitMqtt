@@ -83,16 +83,16 @@ const CONFIG = {
     compactorIdleStop: 8000,
     positionSettle: 300,
     gateOperation: 800,
-    autoPhotoDelay: 2500,  // 2.5 seconds for subsequent items
+    autoPhotoDelay: 2500,  // Not used anymore - weight check is the trigger
     sessionTimeout: 120000,
     sessionMaxDuration: 600000,
-    weightDelay: 1200,
-    photoDelay: 1000,
+    weightDelay: 800,  // ⚡ Reduced from 1200ms to 800ms
+    photoDelay: 800,  // ⚡ Reduced from 1000ms to 800ms
     calibrationDelay: 1000,
     commandDelay: 100,
     resetHomeDelay: 1200,
-    itemDropDelay: 800,
-    photoPositionDelay: 400
+    itemDropDelay: 500,  // ⚡ Reduced from 800ms to 500ms
+    photoPositionDelay: 200  // ⚡ Reduced from 400ms to 200ms
   },
   
   heartbeat: {
@@ -328,28 +328,27 @@ async function scheduleNextPhotoWithPositioning() {
     clearTimeout(state.autoPhotoTimer);
   }
   
+  // ⚡ NO DELAY - Check weight immediately in a loop
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
-      log('🔄 Starting next cycle...', 'info');
-      
-      // ⚡ CHECK WEIGHT FIRST - Only proceed if item is present
+      // ⚡ CHECK WEIGHT IMMEDIATELY - Only proceed if item is present
       try {
         await executeCommand('getWeight');
         await delay(CONFIG.timing.weightDelay);
         
-        // If no weight detected, skip this cycle and schedule next check
+        // If no weight detected, check again very quickly
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
-          log('⏭️ No item detected - skipping cycle', 'info');
           state.weight = null;
           
           if (state.autoCycleEnabled) {
+            // ⚡ Quick recheck - only 500ms delay when no item
             await scheduleNextPhotoWithPositioning();
           }
           return;
         }
         
-        log(`✅ Item detected (${state.weight.weight}g) - proceeding with photo`, 'info');
+        log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
         
         // Clear weight so we measure again after photo for accuracy
         state.weight = null;
@@ -363,7 +362,7 @@ async function scheduleNextPhotoWithPositioning() {
         return;
       }
       
-      // Item detected - proceed with belt movement and photo
+      // Item detected - proceed immediately with belt movement and photo
       state.awaitingDetection = true;
       state.itemAlreadyPositioned = false;
       
@@ -391,15 +390,11 @@ async function scheduleNextPhotoWithPositioning() {
         state.weight = null;
         
         if (state.autoCycleEnabled) {
-          setTimeout(async () => {
-            if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-              await scheduleNextPhotoWithPositioning();
-            }
-          }, CONFIG.timing.autoPhotoDelay);
+          await scheduleNextPhotoWithPositioning();
         }
       }
     }
-  }, CONFIG.timing.autoPhotoDelay);
+  }, 500); // Only 500ms between weight checks
 }
 
 // ============================================
@@ -899,8 +894,11 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // ⚡ Wait 4 seconds after gate opens before first photo cycle
+    // ⚡ Wait 4 seconds ONLY for first bottle (give user time to place it)
+    log('⏳ Waiting 4 seconds for first item...', 'info');
     await delay(4000);
+    
+    // Then start fast weight-based checking
     await scheduleNextPhotoWithPositioning();
     
     log('✅ Guest session active', 'success');

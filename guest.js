@@ -1,4 +1,4 @@
-// agent-guest-only.js - GUEST USER ONLY
+// agent-guest-only.js - GUEST USER ONLY - FIXED OBJECT DETECTION
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -68,8 +68,9 @@ const CONFIG = {
     minValidWeight: 2,
     minConfidenceRetry: 0.50,
     positionBeforePhoto: true,
-    sensorCheckInterval: 1000,  // Check sensor every 1 second
-    sensorCheckTimeout: 3000    // Wait max 3 seconds for object
+    sensorCheckInterval: 500,  // Check sensor every 500ms (faster response)
+    sensorCheckTimeout: 10000,  // Wait max 10 seconds for object (increased)
+    sensorDebounce: 200  // Debounce sensor readings
   },
 
   timing: {
@@ -140,6 +141,7 @@ const state = {
   itemAlreadyPositioned: false,
   objectDetected: false,  // Track if object sensor detects item
   waitingForObject: false,  // Track if we're waiting for object placement
+  lastObjectDetectionTime: null,  // Track when object was last detected
   
   // Bin status tracking
   binStatus: {
@@ -183,7 +185,8 @@ function log(message, level = 'info') {
     'perf': '⚡',
     'crusher': '🔨',
     'camera': '📸',
-    'detection': '🎯'
+    'detection': '🎯',
+    'sensor': '👁️'
   }[level] || 'ℹ️';
   
   console.log(`[${timestamp}] ${prefix} ${message}`);
@@ -250,27 +253,21 @@ function logDetectionStats() {
 }
 
 // ============================================
-// OBJECT DETECTION SENSOR
+// OBJECT DETECTION SENSOR - FIXED VERSION
 // ============================================
-
-async function checkObjectSensor() {
-  try {
-    // The sensor status comes via WebSocket as 'deviceStatus' with specific codes
-    // We'll check if object is present by monitoring the state
-    return state.objectDetected;
-  } catch (error) {
-    log(`Object sensor check error: ${error.message}`, 'error');
-    return false;
-  }
-}
 
 async function waitForObjectDetection() {
   if (!CONFIG.detection.hasObjectSensor) {
     // If no sensor, assume object is present
+    log('⚡ Sensor disabled - proceeding immediately', 'sensor');
     return true;
   }
   
-  log('⏳ Waiting for object placement...', 'info');
+  // CRITICAL FIX: Reset object detection state BEFORE waiting
+  state.objectDetected = false;
+  state.lastObjectDetectionTime = null;
+  
+  log('⏳ Waiting for object placement...', 'sensor');
   state.waitingForObject = true;
   
   const startTime = Date.now();
@@ -280,19 +277,24 @@ async function waitForObjectDetection() {
     const checkInterval = setInterval(() => {
       const elapsed = Date.now() - startTime;
       
-      // Check if object detected
-      if (state.objectDetected) {
-        clearInterval(checkInterval);
-        state.waitingForObject = false;
-        log('✅ Object detected - proceeding', 'success');
-        resolve(true);
-        return;
+      // Check if object detected (with debounce)
+      if (state.objectDetected && state.lastObjectDetectionTime) {
+        const timeSinceDetection = Date.now() - state.lastObjectDetectionTime;
+        
+        if (timeSinceDetection >= CONFIG.detection.sensorDebounce) {
+          clearInterval(checkInterval);
+          state.waitingForObject = false;
+          log(`✅ Object confirmed after ${elapsed}ms`, 'sensor');
+          resolve(true);
+          return;
+        }
       }
       
       // Check if session stopped
       if (!state.autoCycleEnabled) {
         clearInterval(checkInterval);
         state.waitingForObject = false;
+        log('❌ Session stopped while waiting', 'sensor');
         resolve(false);
         return;
       }
@@ -301,9 +303,14 @@ async function waitForObjectDetection() {
       if (elapsed >= timeout) {
         clearInterval(checkInterval);
         state.waitingForObject = false;
-        log('⏰ No object detected - skipping cycle', 'warning');
+        log(`⏰ Timeout after ${(timeout/1000)}s - no object detected`, 'warning');
         resolve(false);
         return;
+      }
+      
+      // Progress indicator every 2 seconds
+      if (elapsed > 0 && elapsed % 2000 < CONFIG.detection.sensorCheckInterval) {
+        log(`⏳ Still waiting... (${Math.round(elapsed/1000)}s)`, 'sensor');
       }
     }, CONFIG.detection.sensorCheckInterval);
   });
@@ -328,6 +335,7 @@ async function startContinuousCompactor() {
     await executeCommand('customMotor', CONFIG.motors.compactor.start);
     state.compactorRunning = true;
     state.lastItemTime = Date.now();
+    log('🔨 Compactor started', 'crusher');
     
     resetCompactorIdleTimer();
     
@@ -360,6 +368,7 @@ async function stopCompactor() {
   
   try {
     await executeCommand('customMotor', CONFIG.motors.compactor.stop);
+    log('🔨 Compactor stopped', 'crusher');
   } catch (error) {
     log(`Compactor stop error: ${error.message}`, 'error');
   }
@@ -389,12 +398,15 @@ async function scheduleNextPhotoWithPositioning() {
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
-      // ⚡ NEW: Wait for object detection BEFORE moving belt
+      log('🔄 Starting next cycle...', 'info');
+      
+      // ⚡ CRITICAL: Wait for object detection BEFORE moving belt
       if (CONFIG.detection.hasObjectSensor) {
         const objectPresent = await waitForObjectDetection();
         
         if (!objectPresent) {
           // No object detected - schedule next check
+          log('⏭️ No object - scheduling next check', 'sensor');
           if (state.autoCycleEnabled) {
             await scheduleNextPhotoWithPositioning();
           }
@@ -403,11 +415,14 @@ async function scheduleNextPhotoWithPositioning() {
       }
       
       // Object detected (or sensor disabled) - proceed with photo
+      log('📸 Object ready - starting photo sequence', 'camera');
       state.awaitingDetection = true;
       state.itemAlreadyPositioned = false;
       
       try {
         if (CONFIG.detection.positionBeforePhoto) {
+          log('🔄 Moving belt to camera position...', 'info');
+          
           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
           await delay(CONFIG.timing.beltToWeight);
           
@@ -415,8 +430,10 @@ async function scheduleNextPhotoWithPositioning() {
           await delay(CONFIG.timing.photoPositionDelay);
           
           state.itemAlreadyPositioned = true;
+          log('✅ Item positioned for photo', 'camera');
         }
         
+        log('📸 Taking photo...', 'camera');
         await executeCommand('takePhoto');
         
       } catch (error) {
@@ -444,7 +461,10 @@ async function scheduleNextPhotoWithPositioning() {
 function checkSystemHealth() {
   const status = state.autoCycleEnabled ? 'ACTIVE' : 'IDLE';
   const compactor = state.compactorRunning ? 'ON' : 'OFF';
-  log(`💓 System: ${status} | Compactor: ${compactor}`, 'info');
+  const objectStatus = state.objectDetected ? 'DETECTED' : 'NONE';
+  const waitStatus = state.waitingForObject ? 'WAITING' : 'READY';
+  
+  log(`💓 System: ${status} | Compactor: ${compactor} | Object: ${objectStatus} | Wait: ${waitStatus}`, 'info');
 }
 
 // ============================================
@@ -534,6 +554,8 @@ const heartbeat = {
       isReady: state.isReady,
       autoCycleEnabled: state.autoCycleEnabled,
       compactorRunning: state.compactorRunning,
+      objectDetected: state.objectDetected,
+      waitingForObject: state.waitingForObject,
       lastCycleTime: state.lastCycleTime,
       detectionStats: state.detectionStats,
       mode: 'guest_only',
@@ -542,8 +564,9 @@ const heartbeat = {
     
     const sessionStatus = state.autoCycleEnabled ? 'ACTIVE' : 'IDLE';
     const compactorStatus = state.compactorRunning ? '🔨' : '⚪';
+    const objectStatus = state.objectDetected ? '👁️' : '⚫';
     
-    console.log(`💓 ${state.moduleId || 'WAIT'} | ${sessionStatus} | ${compactorStatus}`);
+    console.log(`💓 ${state.moduleId || 'WAIT'} | ${sessionStatus} | ${compactorStatus} | ${objectStatus}`);
   }
 };
 
@@ -573,6 +596,10 @@ function runDiagnostics() {
   console.log(`   Sensor enabled: ${CONFIG.detection.hasObjectSensor ? '✅ YES' : '❌ NO'}`);
   console.log(`   Object detected: ${state.objectDetected ? '✅ YES' : '❌ NO'}`);
   console.log(`   Waiting for object: ${state.waitingForObject ? '⏳ YES' : '❌ NO'}`);
+  console.log(`   Last detection: ${state.lastObjectDetectionTime ? new Date(state.lastObjectDetectionTime).toISOString() : 'N/A'}`);
+  console.log(`   Check interval: ${CONFIG.detection.sensorCheckInterval}ms`);
+  console.log(`   Check timeout: ${CONFIG.detection.sensorCheckTimeout}ms`);
+  console.log(`   Debounce: ${CONFIG.detection.sensorDebounce}ms`);
   
   console.log('\n🔨 Compactor:');
   console.log(`   Running: ${state.compactorRunning ? '✅ YES' : '❌ NO'}`);
@@ -582,6 +609,7 @@ function runDiagnostics() {
   console.log('\n📸 Detection:');
   console.log(`   Position before photo: ${CONFIG.detection.positionBeforePhoto ? '✅ ENABLED' : '❌ DISABLED'}`);
   console.log(`   Item positioned: ${state.itemAlreadyPositioned ? '✅ YES' : '❌ NO'}`);
+  console.log(`   Awaiting detection: ${state.awaitingDetection ? '⏳ YES' : '❌ NO'}`);
   
   console.log('\n🗑️ Bin Status:');
   console.log(`   Plastic (Left): ${state.binStatus.plastic ? '❌ FULL' : '✅ OK'}`);
@@ -908,6 +936,8 @@ async function startGuestSession(sessionData) {
     state.sessionStartTime = new Date();
     state.objectDetected = false;  // Reset object detection
     state.waitingForObject = false;
+    state.lastObjectDetectionTime = null;
+    
     startSessionTimers();
     
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
@@ -939,6 +969,8 @@ async function startGuestSession(sessionData) {
       sessionCode: state.sessionCode,
       timestamp: new Date().toISOString()
     }));
+    
+    log('✅ Ready - waiting for first item...', 'success');
     
     await scheduleNextPhotoWithPositioning();
     
@@ -1011,6 +1043,7 @@ async function resetSystemForNextUser(forceStop = false) {
     state.itemAlreadyPositioned = false;
     state.objectDetected = false;
     state.waitingForObject = false;
+    state.lastObjectDetectionTime = null;
     
     clearSessionTimers();
     
@@ -1120,7 +1153,7 @@ function clearSessionTimers() {
 }
 
 // ============================================
-// WEBSOCKET
+// WEBSOCKET - WITH IMPROVED OBJECT DETECTION
 // ============================================
 function connectWebSocket() {
   if (state.ws) {
@@ -1210,11 +1243,17 @@ function connectWebSocket() {
         const binInfo = binStatusMap[binCode];
         
         if (binInfo) {
-          // Handle object detection sensor (code 4)
+          // ⚡ CRITICAL FIX: Handle object detection sensor (code 4)
           if (binInfo.isObjectSensor) {
             // Code 4 means object detected by infrared sensor
+            const wasDetected = state.objectDetected;
             state.objectDetected = true;
-            log('👁️ Object detected by sensor', 'info');
+            state.lastObjectDetectionTime = Date.now();
+            
+            if (!wasDetected) {
+              log('👁️ Object detected by infrared sensor', 'sensor');
+            }
+            
             return;
           }
           
@@ -1389,6 +1428,8 @@ mqttClient.on('message', async (topic, message) => {
           resetting: state.resetting,
           compactorRunning: state.compactorRunning,
           moduleId: state.moduleId,
+          objectDetected: state.objectDetected,
+          waitingForObject: state.waitingForObject,
           detectionStats: state.detectionStats,
           mode: 'guest_only',
           timestamp: new Date().toISOString()
@@ -1520,8 +1561,9 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE');
+console.log('🚀 RVM AGENT - GUEST MODE (FIXED DETECTION)');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
+console.log('Object Detection: Enabled with proper state management');
 console.log('='.repeat(50) + '\n');

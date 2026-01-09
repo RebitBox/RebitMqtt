@@ -351,6 +351,9 @@ async function scheduleNextPhotoWithPositioning() {
         
         log(`✅ Item detected (${state.weight.weight}g) - proceeding with photo`, 'info');
         
+        // Clear weight so we measure again after photo for accuracy
+        state.weight = null;
+        
       } catch (error) {
         log(`Weight check error: ${error.message}`, 'error');
         
@@ -390,8 +393,7 @@ async function scheduleNextPhotoWithPositioning() {
         if (state.autoCycleEnabled) {
           setTimeout(async () => {
             if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-              state.awaitingDetection = true;
-              await executeCommand('takePhoto');
+              await scheduleNextPhotoWithPositioning();
             }
           }, CONFIG.timing.autoPhotoDelay);
         }
@@ -1149,8 +1151,10 @@ function connectWebSocket() {
         
         mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
         
+        // After AI detection, get weight measurement
         if (state.autoCycleEnabled && state.awaitingDetection) {
           state.awaitingDetection = false;
+          log('🔍 AI detection complete - measuring weight...', 'detection');
           setTimeout(() => executeCommand('getWeight'), 300);
         }
         return;
@@ -1229,8 +1233,10 @@ function connectWebSocket() {
         
         mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
         
-        // Only process weight if we're in detection mode (after photo taken)
-        if (state.awaitingDetection && state.aiResult && !state.cycleInProgress) {
+        // If we have AI result, this is the final weight after photo - process the cycle
+        if (state.aiResult && state.autoCycleEnabled && !state.cycleInProgress) {
+          log(`⚖️ Final weight: ${state.weight.weight}g`, 'info');
+          
           if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
             state.calibrationAttempts++;
             setTimeout(async () => {
@@ -1242,26 +1248,26 @@ function connectWebSocket() {
           
           if (state.weight.weight > 0) state.calibrationAttempts = 0;
           
-          if (state.autoCycleEnabled) {
-            if (state.weight.weight < CONFIG.detection.minValidWeight) {
-              state.aiResult = null;
-              state.weight = null;
-              state.itemAlreadyPositioned = false;
-              state.awaitingDetection = false;
-              
-              await scheduleNextPhotoWithPositioning();
-              return;
-            }
+          if (state.weight.weight < CONFIG.detection.minValidWeight) {
+            log('⚠️ Weight too low after photo - skipping', 'warning');
+            state.aiResult = null;
+            state.weight = null;
+            state.itemAlreadyPositioned = false;
             
-            if (state.aiResult.materialType === 'UNKNOWN') {
-              state.cycleInProgress = true;
-              setTimeout(() => executeRejectionCycle(), 500);
-              return;
-            }
-            
-            state.cycleInProgress = true;
-            setTimeout(() => executeAutoCycle(), 500);
+            await scheduleNextPhotoWithPositioning();
+            return;
           }
+          
+          if (state.aiResult.materialType === 'UNKNOWN') {
+            log('❌ Unknown material - rejecting', 'warning');
+            state.cycleInProgress = true;
+            setTimeout(() => executeRejectionCycle(), 500);
+            return;
+          }
+          
+          log('✅ Starting auto cycle...', 'success');
+          state.cycleInProgress = true;
+          setTimeout(() => executeAutoCycle(), 500);
         }
         return;
       }

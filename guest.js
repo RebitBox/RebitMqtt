@@ -333,7 +333,34 @@ async function scheduleNextPhotoWithPositioning() {
       
       log('🔄 Starting next cycle...', 'info');
       
-      // ⚡ NO SENSOR - Proceed immediately to belt movement
+      // ⚡ CHECK WEIGHT FIRST - Only proceed if item is present
+      try {
+        await executeCommand('getWeight');
+        await delay(CONFIG.timing.weightDelay);
+        
+        // If no weight detected, skip this cycle and schedule next check
+        if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
+          log('⏭️ No item detected - skipping cycle', 'info');
+          state.weight = null;
+          
+          if (state.autoCycleEnabled) {
+            await scheduleNextPhotoWithPositioning();
+          }
+          return;
+        }
+        
+        log(`✅ Item detected (${state.weight.weight}g) - proceeding with photo`, 'info');
+        
+      } catch (error) {
+        log(`Weight check error: ${error.message}`, 'error');
+        
+        if (state.autoCycleEnabled) {
+          await scheduleNextPhotoWithPositioning();
+        }
+        return;
+      }
+      
+      // Item detected - proceed with belt movement and photo
       state.awaitingDetection = true;
       state.itemAlreadyPositioned = false;
       
@@ -358,6 +385,7 @@ async function scheduleNextPhotoWithPositioning() {
         log(`Photo positioning error: ${error.message}`, 'error');
         state.awaitingDetection = false;
         state.itemAlreadyPositioned = false;
+        state.weight = null;
         
         if (state.autoCycleEnabled) {
           setTimeout(async () => {
@@ -1201,35 +1229,39 @@ function connectWebSocket() {
         
         mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
         
-        if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
-          state.calibrationAttempts++;
-          setTimeout(async () => {
-            await executeCommand('calibrateWeight');
-            setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
-          }, 500);
-          return;
-        }
-        
-        if (state.weight.weight > 0) state.calibrationAttempts = 0;
-        
-        if (state.autoCycleEnabled && state.aiResult && !state.cycleInProgress) {
-          if (state.weight.weight < CONFIG.detection.minValidWeight) {
-            state.aiResult = null;
-            state.weight = null;
-            state.itemAlreadyPositioned = false;
+        // Only process weight if we're in detection mode (after photo taken)
+        if (state.awaitingDetection && state.aiResult && !state.cycleInProgress) {
+          if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
+            state.calibrationAttempts++;
+            setTimeout(async () => {
+              await executeCommand('calibrateWeight');
+              setTimeout(() => executeCommand('getWeight'), CONFIG.timing.calibrationDelay);
+            }, 500);
+            return;
+          }
+          
+          if (state.weight.weight > 0) state.calibrationAttempts = 0;
+          
+          if (state.autoCycleEnabled) {
+            if (state.weight.weight < CONFIG.detection.minValidWeight) {
+              state.aiResult = null;
+              state.weight = null;
+              state.itemAlreadyPositioned = false;
+              state.awaitingDetection = false;
+              
+              await scheduleNextPhotoWithPositioning();
+              return;
+            }
             
-            await scheduleNextPhotoWithPositioning();
-            return;
-          }
-          
-          if (state.aiResult.materialType === 'UNKNOWN') {
+            if (state.aiResult.materialType === 'UNKNOWN') {
+              state.cycleInProgress = true;
+              setTimeout(() => executeRejectionCycle(), 500);
+              return;
+            }
+            
             state.cycleInProgress = true;
-            setTimeout(() => executeRejectionCycle(), 500);
-            return;
+            setTimeout(() => executeAutoCycle(), 500);
           }
-          
-          state.cycleInProgress = true;
-          setTimeout(() => executeAutoCycle(), 500);
         }
         return;
       }

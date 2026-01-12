@@ -1,4 +1,4 @@
-// agent-guest-only.js - COMPLETE WORKING VERSION
+// agent-guest-only.js - COMPLETE WORKING VERSION WITH SESSION END FIX
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -75,25 +75,25 @@ const CONFIG = {
   },
 
   timing: {
-  beltToWeight: 1800,          // ↓ from 2500ms - belt movement to camera position
-  beltToStepper: 2200,         // ↓ from 2800ms - belt movement to stepper
-  beltReverse: 3500,           // ↓ from 4000ms - belt reverse for rejection
-  stepperRotate: 2200,         // ↓ from 2500ms - stepper motor rotation
-  stepperReset: 3000,          // ↓ from 3500ms - stepper return to home
-  compactorIdleStop: 8000,     // SAME - compactor idle timeout
-  positionSettle: 200,         // ↓ from 300ms - position settling time
-  gateOperation: 600,          // ↓ from 800ms - gate open/close operation
-  autoPhotoDelay: 2500,        // NOT USED - weight-based trigger now
-  sessionTimeout: 300000,      // ↑ from 120000ms (2 min) to 300000ms (5 min)
-  sessionMaxDuration: 600000,  // SAME - 10 minutes max session
-  weightDelay: 600,            // ↓ from 800ms - weight measurement delay
-  photoDelay: 600,             // ↓ from 800ms - photo capture delay
-  calibrationDelay: 800,       // ↓ from 1000ms - calibration delay
-  commandDelay: 100,           // SAME - delay between commands
-  resetHomeDelay: 1000,        // ↓ from 1200ms - stepper home reset delay
-  itemDropDelay: 300,          // ↓ from 500ms - item drop delay
-  photoPositionDelay: 100      // ↓ from 200ms - settle before photo
-},
+    beltToWeight: 1800,          // ↓ from 2500ms - belt movement to camera position
+    beltToStepper: 2200,         // ↓ from 2800ms - belt movement to stepper
+    beltReverse: 3500,           // ↓ from 4000ms - belt reverse for rejection
+    stepperRotate: 2200,         // ↓ from 2500ms - stepper motor rotation
+    stepperReset: 3000,          // ↓ from 3500ms - stepper return to home
+    compactorIdleStop: 8000,     // SAME - compactor idle timeout
+    positionSettle: 200,         // ↓ from 300ms - position settling time
+    gateOperation: 600,          // ↓ from 800ms - gate open/close operation
+    autoPhotoDelay: 2500,        // NOT USED - weight-based trigger now
+    sessionTimeout: 300000,      // ↑ from 120000ms (2 min) to 300000ms (5 min)
+    sessionMaxDuration: 600000,  // SAME - 10 minutes max session
+    weightDelay: 600,            // ↓ from 800ms - weight measurement delay
+    photoDelay: 600,             // ↓ from 800ms - photo capture delay
+    calibrationDelay: 800,       // ↓ from 1000ms - calibration delay
+    commandDelay: 100,           // SAME - delay between commands
+    resetHomeDelay: 1000,        // ↓ from 1200ms - stepper home reset delay
+    itemDropDelay: 300,          // ↓ from 500ms - item drop delay
+    photoPositionDelay: 100      // ↓ from 200ms - settle before photo
+  },
   
   heartbeat: {
     interval: 30,
@@ -958,6 +958,29 @@ async function resetSystemForNextUser(forceStop = false) {
   } catch (error) {
     log(`Reset error: ${error.message}`, 'error');
   } finally {
+    // 🔥 CRITICAL FIX: Notify backend BEFORE clearing state
+    try {
+      if (state.sessionCode && state.itemsProcessed >= 0) {
+        log(`📤 Sending session_ended event (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
+        
+        mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
+          deviceId: CONFIG.device.id,
+          status: 'session_ended',
+          event: 'session_ended',
+          sessionCode: state.sessionCode,
+          itemsProcessed: state.itemsProcessed,
+          sessionType: 'guest',
+          timestamp: new Date().toISOString()
+        }));
+        
+        log('✅ Session end notification sent to backend', 'success');
+        await delay(1500); // Give backend time to process
+      }
+    } catch (error) {
+      log(`Session end notification error: ${error.message}`, 'warning');
+    }
+    
+    // NOW clear state
     state.aiResult = null;
     state.weight = null;
     state.sessionId = null;
@@ -1012,7 +1035,7 @@ async function handleSessionTimeout(reason) {
   }
   
   try {
-    if (state.sessionCode && state.itemsProcessed > 0) {
+    if (state.sessionCode && state.itemsProcessed >= 0) {
       mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
         deviceId: CONFIG.device.id,
         status: 'session_timeout',
@@ -1488,9 +1511,11 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE');
+console.log('🚀 RVM AGENT - GUEST MODE (FIXED SESSION END)');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
+console.log('Session timeout: 5 minutes inactivity');
+console.log('✅ Session end notifications: ENABLED');
 console.log('='.repeat(50) + '\n');

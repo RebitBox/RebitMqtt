@@ -75,25 +75,25 @@ const CONFIG = {
   },
 
   timing: {
-    beltToWeight: 2500,
-    beltToStepper: 2800,
-    beltReverse: 4000,
-    stepperRotate: 2500,
-    stepperReset: 3500,
-    compactorIdleStop: 8000,
-    positionSettle: 300,
-    gateOperation: 800,
-    autoPhotoDelay: 2500,  // Not used anymore - weight check is the trigger
-    sessionTimeout: 120000,
-    sessionMaxDuration: 600000,
-    weightDelay: 800,  // ⚡ Reduced from 1200ms to 800ms
-    photoDelay: 800,  // ⚡ Reduced from 1000ms to 800ms
-    calibrationDelay: 1000,
-    commandDelay: 100,
-    resetHomeDelay: 1200,
-    itemDropDelay: 500,  // ⚡ Reduced from 800ms to 500ms
-    photoPositionDelay: 200  // ⚡ Reduced from 400ms to 200ms
-  },
+  beltToWeight: 1800,          // ↓ from 2500ms - belt movement to camera position
+  beltToStepper: 2200,         // ↓ from 2800ms - belt movement to stepper
+  beltReverse: 3500,           // ↓ from 4000ms - belt reverse for rejection
+  stepperRotate: 2200,         // ↓ from 2500ms - stepper motor rotation
+  stepperReset: 3000,          // ↓ from 3500ms - stepper return to home
+  compactorIdleStop: 8000,     // SAME - compactor idle timeout
+  positionSettle: 200,         // ↓ from 300ms - position settling time
+  gateOperation: 600,          // ↓ from 800ms - gate open/close operation
+  autoPhotoDelay: 2500,        // NOT USED - weight-based trigger now
+  sessionTimeout: 300000,      // ↑ from 120000ms (2 min) to 300000ms (5 min)
+  sessionMaxDuration: 600000,  // SAME - 10 minutes max session
+  weightDelay: 600,            // ↓ from 800ms - weight measurement delay
+  photoDelay: 600,             // ↓ from 800ms - photo capture delay
+  calibrationDelay: 800,       // ↓ from 1000ms - calibration delay
+  commandDelay: 100,           // SAME - delay between commands
+  resetHomeDelay: 1000,        // ↓ from 1200ms - stepper home reset delay
+  itemDropDelay: 300,          // ↓ from 500ms - item drop delay
+  photoPositionDelay: 100      // ↓ from 200ms - settle before photo
+},
   
   heartbeat: {
     interval: 30,

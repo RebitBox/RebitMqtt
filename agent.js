@@ -1,4 +1,4 @@
-// agent-guest-only.js - GATE CLOSES IMMEDIATELY ON SESSION END
+// agent-guest-only.js - GATE CLOSES IMMEDIATELY ON SESSION END - FIXED
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -156,6 +156,7 @@ const state = {
   lastCycleTime: null,
   averageCycleTime: null,
   cycleCount: 0,
+  sessionCount: 0,  // Track session number for debugging
   
   // Detection analytics
   detectionStats: {
@@ -855,6 +856,12 @@ async function executeAutoCycle() {
 // GUEST SESSION MANAGEMENT
 // ============================================
 async function startGuestSession(sessionData) {
+  state.sessionCount++;
+  
+  console.log('\n' + '='.repeat(50));
+  console.log(`🎬 GUEST SESSION #${state.sessionCount} START`);
+  console.log('='.repeat(50));
+  
   log('🎬 Starting guest session', 'info');
   
   try {
@@ -918,26 +925,32 @@ async function startGuestSession(sessionData) {
 async function resetSystemForNextUser(forceStop = false) {
   const resetStartTime = Date.now();
   
-  if (state.resetting) {
-    log('⚠️ Reset already in progress - skipping duplicate call', 'warning');
-    return;
-  }
+  // 🔥 REMOVED the early return check - this was causing gate not to close on second session
   
   console.log('\n' + '='.repeat(50));
-  console.log('🔄 RESET FOR NEXT USER - Session #' + (state.itemsProcessed || 0));
+  console.log(`🔄 RESET AFTER SESSION #${state.sessionCount}`);
   console.log('='.repeat(50) + '\n');
   
-  // Gate should already be closed by caller (endSession or handleSessionTimeout)
-  // But close it again just to be safe
-  log('🚪 Double-checking gate is closed...', 'info');
+  // 🚨 ALWAYS close gate at start of reset - no conditions
+  log('🚪 Ensuring gate is closed (reset start)...', 'info');
   try {
     await executeCommand('closeGate');
-    log('✅ Gate close confirmed', 'success');
+    await delay(400);
+    log('✅ Gate close confirmed at reset start', 'success');
   } catch (error) {
     log(`Gate close error (non-fatal): ${error.message}`, 'error');
   }
   
-  // NOW set resetting flag
+  // Second attempt for absolute certainty
+  try {
+    await executeCommand('closeGate');
+    await delay(300);
+    log('✅ Gate close confirmed (second attempt)', 'success');
+  } catch (error) {
+    // Ignore second attempt error
+  }
+  
+  // NOW set resetting flag (after gate is closed)
   state.resetting = true;
   
   try {
@@ -992,7 +1005,7 @@ async function resetSystemForNextUser(forceStop = false) {
         }));
         
         log('✅ Session end notification sent', 'success');
-        await delay(1500); // Give backend time to process
+        await delay(1500);
       }
     } catch (error) {
       log(`⚠️ Session end notification error: ${error.message}`, 'warning');
@@ -1014,6 +1027,7 @@ async function resetSystemForNextUser(forceStop = false) {
     
     clearSessionTimers();
     
+    // 🔥 IMPORTANT: Reset resetting flag LAST
     state.resetting = false;
     state.isReady = true;
     
@@ -1053,11 +1067,22 @@ async function handleSessionTimeout(reason) {
   log(`⏱️ Session timeout: ${reason}`, 'warning');
   
   // 🚨 Close gate IMMEDIATELY on timeout
+  log('🚪 Closing gate immediately (timeout)', 'warning');
   try {
     await executeCommand('closeGate');
-    log('✅ Gate closed immediately on timeout', 'success');
+    await delay(400);
+    log('✅ Gate closed on timeout', 'success');
   } catch (error) {
     log(`❌ Gate close error: ${error.message}`, 'error');
+  }
+  
+  // Try second time for safety
+  try {
+    await executeCommand('closeGate');
+    await delay(300);
+    log('✅ Gate close confirmed (second attempt)', 'success');
+  } catch (error) {
+    // Ignore second attempt error
   }
   
   state.autoCycleEnabled = false;
@@ -1095,6 +1120,9 @@ async function handleSessionTimeout(reason) {
       await delay(1000);
     }
   }
+  
+  // 🔥 Force resetting to false before calling reset
+  state.resetting = false;
   
   await resetSystemForNextUser(false);
 }
@@ -1447,15 +1475,43 @@ mqttClient.on('message', async (topic, message) => {
       }
       
       if (payload.action === 'endSession') {
-        log('🛑 END SESSION command received - closing gate immediately!', 'warning');
+        console.log('\n' + '🚨'.repeat(25));
+        console.log('🛑 END SESSION COMMAND RECEIVED');
+        console.log('🚨'.repeat(25) + '\n');
         
-        // 🚨 CRITICAL: Close gate IMMEDIATELY before anything else
+        // 🔥 CRITICAL: Stop auto cycle FIRST before anything else
+        state.autoCycleEnabled = false;
+        state.awaitingDetection = false;
+        
+        if (state.autoPhotoTimer) {
+          clearTimeout(state.autoPhotoTimer);
+          state.autoPhotoTimer = null;
+        }
+        
+        // 🚨 SUPER AGGRESSIVE: Close gate IMMEDIATELY with retries
+        log('🚪 IMMEDIATE GATE CLOSE - Attempt 1', 'warning');
         try {
           await executeCommand('closeGate');
-          log('✅ Gate closed immediately on session end', 'success');
+          await delay(400);
+          log('✅ Gate close command 1 sent', 'success');
         } catch (error) {
-          log(`❌ Gate close error: ${error.message}`, 'error');
+          log(`❌ Gate close attempt 1 failed: ${error.message}`, 'error');
         }
+        
+        // Second attempt for absolute certainty
+        log('🚪 IMMEDIATE GATE CLOSE - Attempt 2 (safety)', 'warning');
+        try {
+          await executeCommand('closeGate');
+          await delay(400);
+          log('✅ Gate close command 2 sent', 'success');
+        } catch (error) {
+          log(`❌ Gate close attempt 2 failed: ${error.message}`, 'error');
+        }
+        
+        console.log('✅ Gate closing commands sent - proceeding with reset\n');
+        
+        // 🔥 FORCE reset flag to false so resetSystemForNextUser doesn't skip
+        state.resetting = false;
         
         // Now proceed with reset
         await resetSystemForNextUser(false);
@@ -1556,11 +1612,11 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE');
+console.log('🚀 RVM AGENT - GUEST MODE - GATE FIX v2');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');
-console.log('✅ Gate closes IMMEDIATELY on session end');
+console.log('✅ Gate closes IMMEDIATELY on session end - FIXED');
 console.log('='.repeat(50) + '\n');

@@ -927,19 +927,17 @@ async function resetSystemForNextUser(forceStop = false) {
   console.log('🔄 RESET FOR NEXT USER - Session #' + (state.itemsProcessed || 0));
   console.log('='.repeat(50) + '\n');
   
-  // 🚨 CLOSE GATE IMMEDIATELY - BEFORE setting resetting flag (same as QR agent)
-  log('🚪 Step 1: Closing gate (BEFORE resetting flag)...', 'info');
+  // Gate should already be closed by caller (endSession or handleSessionTimeout)
+  // But close it again just to be safe
+  log('🚪 Double-checking gate is closed...', 'info');
   try {
-    const gateCloseStart = Date.now();
     await executeCommand('closeGate');
-    const gateCloseDuration = Date.now() - gateCloseStart;
-    log(`✅ Gate closed successfully (took ${gateCloseDuration}ms)`, 'success');
+    log('✅ Gate close confirmed', 'success');
   } catch (error) {
-    log(`❌ Gate close error: ${error.message}`, 'error');
+    log(`Gate close error (non-fatal): ${error.message}`, 'error');
   }
   
   // NOW set resetting flag
-  log('🔄 Step 2: Setting resetting flag...', 'info');
   state.resetting = true;
   
   try {
@@ -1053,6 +1051,14 @@ async function resetSystemForNextUser(forceStop = false) {
 
 async function handleSessionTimeout(reason) {
   log(`⏱️ Session timeout: ${reason}`, 'warning');
+  
+  // 🚨 Close gate IMMEDIATELY on timeout
+  try {
+    await executeCommand('closeGate');
+    log('✅ Gate closed immediately on timeout', 'success');
+  } catch (error) {
+    log(`❌ Gate close error: ${error.message}`, 'error');
+  }
   
   state.autoCycleEnabled = false;
   state.awaitingDetection = false;
@@ -1441,6 +1447,17 @@ mqttClient.on('message', async (topic, message) => {
       }
       
       if (payload.action === 'endSession') {
+        log('🛑 END SESSION command received - closing gate immediately!', 'warning');
+        
+        // 🚨 CRITICAL: Close gate IMMEDIATELY before anything else
+        try {
+          await executeCommand('closeGate');
+          log('✅ Gate closed immediately on session end', 'success');
+        } catch (error) {
+          log(`❌ Gate close error: ${error.message}`, 'error');
+        }
+        
+        // Now proceed with reset
         await resetSystemForNextUser(false);
         return;
       }

@@ -1,4 +1,4 @@
-// agent-guest-only.js - COMPLETE WORKING VERSION WITH SESSION END FIX
+// agent-guest-only.js - GATE CLOSES IMMEDIATELY ON SESSION END
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -915,18 +915,23 @@ async function resetSystemForNextUser(forceStop = false) {
     return;
   }
   
-  log('🔄 Resetting system', 'info');
-  state.resetting = true;
+  log('🔄 Resetting system for next user', 'info');
   
-  // ⚡ Close gate IMMEDIATELY when session ends
+  // 🔥 CRITICAL: Close gate FIRST - before anything else
   try {
+    log('🚪 Closing gate immediately...', 'info');
     await executeCommand('closeGate');
-    log('🚪 Gate closed', 'info');
+    await delay(CONFIG.timing.gateOperation); // Wait for gate to fully close
+    log('✅ Gate closed', 'success');
   } catch (error) {
-    log(`Gate close error: ${error.message}`, 'error');
+    log(`❌ Gate close error: ${error.message}`, 'error');
   }
   
+  // Now set resetting flag and continue with cleanup
+  state.resetting = true;
+  
   try {
+    // Stop all automatic processes immediately
     state.autoCycleEnabled = false;
     state.awaitingDetection = false;
     
@@ -935,6 +940,7 @@ async function resetSystemForNextUser(forceStop = false) {
       state.autoPhotoTimer = null;
     }
     
+    // Wait for any in-progress cycle to complete (with timeout)
     if (state.cycleInProgress) {
       const maxWait = 60000;
       const startWait = Date.now();
@@ -944,6 +950,7 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
+    // Stop compactor
     if (forceStop) {
       await stopCompactor();
     } else {
@@ -953,15 +960,16 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
+    // Stop belt
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
 
   } catch (error) {
     log(`Reset error: ${error.message}`, 'error');
   } finally {
-    // 🔥 CRITICAL FIX: Notify backend BEFORE clearing state
+    // 🔥 CRITICAL: Send session_ended event BEFORE clearing state
     try {
       if (state.sessionCode && state.itemsProcessed >= 0) {
-        log(`📤 Sending session_ended event (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
+        log(`📤 Notifying backend: Session ended (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
         
         mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
           deviceId: CONFIG.device.id,
@@ -973,14 +981,14 @@ async function resetSystemForNextUser(forceStop = false) {
           timestamp: new Date().toISOString()
         }));
         
-        log('✅ Session end notification sent to backend', 'success');
+        log('✅ Session end notification sent', 'success');
         await delay(1500); // Give backend time to process
       }
     } catch (error) {
-      log(`Session end notification error: ${error.message}`, 'warning');
+      log(`⚠️ Session end notification error: ${error.message}`, 'warning');
     }
     
-    // NOW clear state
+    // NOW clear all state variables
     state.aiResult = null;
     state.weight = null;
     state.sessionId = null;
@@ -999,6 +1007,7 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady = true;
     
+    // Notify system is ready for next user
     mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
       deviceId: CONFIG.device.id,
       status: 'ready',
@@ -1015,7 +1024,7 @@ async function resetSystemForNextUser(forceStop = false) {
       timestamp: new Date().toISOString()
     }));
     
-    log('✅ Ready for next guest', 'success');
+    log('✅ System ready for next guest', 'success');
   }
 }
 
@@ -1511,11 +1520,11 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE (FIXED SESSION END)');
+console.log('🚀 RVM AGENT - GUEST MODE');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');
-console.log('✅ Session end notifications: ENABLED');
+console.log('✅ Gate closes IMMEDIATELY on session end');
 console.log('='.repeat(50) + '\n');

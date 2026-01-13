@@ -135,6 +135,9 @@ const state = {
   compactorIdleTimer: null,
   lastItemTime: null,
   
+  // Gate state tracking
+  gateOpen: false,
+  
   autoPhotoTimer: null,
   detectionRetries: 0,
   awaitingDetection: false,
@@ -676,11 +679,13 @@ async function executeCommand(action, params = {}) {
     case 'openGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
       apiPayload = { moduleId: state.moduleId, motorId: '01', type: '03', deviceType };
+      log('🚪 Opening gate...', 'info');
       break;
       
     case 'closeGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
       apiPayload = { moduleId: state.moduleId, motorId: '01', type: '01', deviceType };
+      log('🚪 Closing gate...', 'info');
       break;
       
     case 'getWeight':
@@ -911,18 +916,26 @@ async function startGuestSession(sessionData) {
 }
 
 async function resetSystemForNextUser(forceStop = false) {
+  // Prevent multiple simultaneous resets but don't skip gate closing
   if (state.resetting) {
+    log('⚠️ Reset already in progress - waiting...', 'warning');
+    // Wait for current reset to finish
+    const maxWait = 10000;
+    const startWait = Date.now();
+    while (state.resetting && (Date.now() - startWait) < maxWait) {
+      await delay(500);
+    }
     return;
   }
   
   log('🔄 Resetting system for next user', 'info');
   
-  // 🔥 CRITICAL: Close gate FIRST - before anything else
+  // 🔥 CRITICAL: Close gate FIRST - ALWAYS, even if already closed
   try {
-    log('🚪 Closing gate immediately...', 'info');
+    log('🚪 Sending gate close command...', 'info');
     await executeCommand('closeGate');
     await delay(CONFIG.timing.gateOperation); // Wait for gate to fully close
-    log('✅ Gate closed', 'success');
+    log('✅ Gate close command sent', 'success');
   } catch (error) {
     log(`❌ Gate close error: ${error.message}`, 'error');
   }

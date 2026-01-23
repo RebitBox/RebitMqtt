@@ -1,4 +1,4 @@
-// agent-guest-only.js - GATE CLOSES IMMEDIATELY ON SESSION END - FIXED
+// agent-guest-only.js - COMPLETE UPDATED VERSION WITH BIN STATUS FIX
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -65,7 +65,7 @@ const CONFIG = {
     GLASS: 0.65,
     retryDelay: 1500,
     maxRetries: 2,
-    hasObjectSensor: false,  // ⚡ DISABLED - System proceeds immediately
+    hasObjectSensor: false,
     minValidWeight: 2,
     minConfidenceRetry: 0.50,
     positionBeforePhoto: true,
@@ -75,24 +75,24 @@ const CONFIG = {
   },
 
   timing: {
-    beltToWeight: 1800,          // ↓ from 2500ms - belt movement to camera position
-    beltToStepper: 2200,         // ↓ from 2800ms - belt movement to stepper
-    beltReverse: 3500,           // ↓ from 4000ms - belt reverse for rejection
-    stepperRotate: 2200,         // ↓ from 2500ms - stepper motor rotation
-    stepperReset: 3000,          // ↓ from 3500ms - stepper return to home
-    compactorIdleStop: 8000,     // SAME - compactor idle timeout
-    positionSettle: 200,         // ↓ from 300ms - position settling time
-    gateOperation: 600,          // ↓ from 800ms - gate open/close operation
-    autoPhotoDelay: 2500,        // NOT USED - weight-based trigger now
-    sessionTimeout: 300000,      // ↑ from 120000ms (2 min) to 300000ms (5 min)
-    sessionMaxDuration: 600000,  // SAME - 10 minutes max session
-    weightDelay: 600,            // ↓ from 800ms - weight measurement delay
-    photoDelay: 600,             // ↓ from 800ms - photo capture delay
-    calibrationDelay: 800,       // ↓ from 1000ms - calibration delay
-    commandDelay: 100,           // SAME - delay between commands
-    resetHomeDelay: 1000,        // ↓ from 1200ms - stepper home reset delay
-    itemDropDelay: 300,          // ↓ from 500ms - item drop delay
-    photoPositionDelay: 100      // ↓ from 200ms - settle before photo
+    beltToWeight: 1800,
+    beltToStepper: 2200,
+    beltReverse: 3500,
+    stepperRotate: 2200,
+    stepperReset: 3000,
+    compactorIdleStop: 8000,
+    positionSettle: 200,
+    gateOperation: 600,
+    autoPhotoDelay: 2500,
+    sessionTimeout: 300000,
+    sessionMaxDuration: 600000,
+    weightDelay: 600,
+    photoDelay: 600,
+    calibrationDelay: 800,
+    commandDelay: 100,
+    resetHomeDelay: 1000,
+    itemDropDelay: 300,
+    photoPositionDelay: 100
   },
   
   heartbeat: {
@@ -119,7 +119,6 @@ const state = {
   ws: null,
   isReady: false,
   
-  // Session tracking (guest only)
   sessionId: null,
   sessionCode: null,
   isGuestSession: false,
@@ -129,13 +128,11 @@ const state = {
   sessionTimeoutTimer: null,
   maxDurationTimer: null,
   
-  // Continuous compactor state
   compactorRunning: false,
   compactorTimer: null,
   compactorIdleTimer: null,
   lastItemTime: null,
   
-  // Gate state tracking
   gateOpen: false,
   
   autoPhotoTimer: null,
@@ -144,7 +141,6 @@ const state = {
   resetting: false,
   itemAlreadyPositioned: false,
   
-  // Bin status tracking
   binStatus: {
     plastic: false,
     metal: false,
@@ -152,13 +148,11 @@ const state = {
     glass: false
   },
   
-  // Performance tracking
   lastCycleTime: null,
   averageCycleTime: null,
   cycleCount: 0,
-  sessionCount: 0,  // Track session number for debugging
+  sessionCount: 0,
   
-  // Detection analytics
   detectionStats: {
     totalAttempts: 0,
     firstTimeSuccess: 0,
@@ -332,21 +326,17 @@ async function scheduleNextPhotoWithPositioning() {
     clearTimeout(state.autoPhotoTimer);
   }
   
-  // ⚡ NO DELAY - Check weight immediately in a loop
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
-      // ⚡ CHECK WEIGHT IMMEDIATELY - Only proceed if item is present
       try {
         await executeCommand('getWeight');
         await delay(CONFIG.timing.weightDelay);
         
-        // If no weight detected, check again very quickly
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
           state.weight = null;
           
           if (state.autoCycleEnabled) {
-            // ⚡ Quick recheck - only 500ms delay when no item
             await scheduleNextPhotoWithPositioning();
           }
           return;
@@ -354,7 +344,6 @@ async function scheduleNextPhotoWithPositioning() {
         
         log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
         
-        // Clear weight so we measure again after photo for accuracy
         state.weight = null;
         
       } catch (error) {
@@ -366,7 +355,6 @@ async function scheduleNextPhotoWithPositioning() {
         return;
       }
       
-      // Item detected - proceed immediately with belt movement and photo
       state.awaitingDetection = true;
       state.itemAlreadyPositioned = false;
       
@@ -398,7 +386,7 @@ async function scheduleNextPhotoWithPositioning() {
         }
       }
     }
-  }, 500); // Only 500ms between weight checks
+  }, 500);
 }
 
 // ============================================
@@ -483,6 +471,18 @@ const heartbeat = {
             message: 'Press Start to begin',
             timestamp
           }));
+          
+          // ✅ PUBLISH INITIAL BIN STATUS
+          mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
+            deviceId: CONFIG.device.id,
+            binStatus: state.binStatus,
+            timestamp
+          }), { 
+            qos: 1, 
+            retain: true 
+          });
+          
+          log('📤 Initial bin status published', 'info');
         }
       }
     }
@@ -576,7 +576,6 @@ function determineMaterialType(aiData) {
   let hasStrongKeyword = false;
   let detectionFormat = 'unknown';
   
-  // Priority 1: New standardized format "0-PET" or "1-Can"
   if (className === '0-pet' || className.startsWith('0-pet')) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
@@ -589,7 +588,6 @@ function determineMaterialType(aiData) {
     hasStrongKeyword = true;
     detectionFormat = 'new_standard';
   }
-  // Priority 2: Check for number prefix format variations
   else if (/^0[-_\s]*(pet|plastic|bottle)/i.test(className)) {
     materialType = 'PLASTIC_BOTTLE';
     threshold = CONFIG.detection.PLASTIC_BOTTLE;
@@ -602,7 +600,6 @@ function determineMaterialType(aiData) {
     hasStrongKeyword = true;
     detectionFormat = 'variant_format';
   }
-  // Priority 3: Legacy format support (fallback)
   else if (className.includes('易拉罐') || className.includes('铝')) {
     materialType = 'METAL_CAN';
     threshold = CONFIG.detection.METAL_CAN;
@@ -906,11 +903,9 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
     
-    // ⚡ Wait 4 seconds ONLY for first bottle (give user time to place it)
     log('⏳ Waiting 4 seconds for first item...', 'info');
     await delay(4000);
     
-    // Then start fast weight-based checking
     await scheduleNextPhotoWithPositioning();
     
     log('✅ Guest session active', 'success');
@@ -925,13 +920,10 @@ async function startGuestSession(sessionData) {
 async function resetSystemForNextUser(forceStop = false) {
   const resetStartTime = Date.now();
   
-  // 🔥 REMOVED the early return check - this was causing gate not to close on second session
-  
   console.log('\n' + '='.repeat(50));
   console.log(`🔄 RESET AFTER SESSION #${state.sessionCount}`);
   console.log('='.repeat(50) + '\n');
   
-  // 🚨 ALWAYS close gate at start of reset - no conditions
   log('🚪 Ensuring gate is closed (reset start)...', 'info');
   try {
     await executeCommand('closeGate');
@@ -941,20 +933,17 @@ async function resetSystemForNextUser(forceStop = false) {
     log(`Gate close error (non-fatal): ${error.message}`, 'error');
   }
   
-  // Second attempt for absolute certainty
   try {
     await executeCommand('closeGate');
     await delay(300);
     log('✅ Gate close confirmed (second attempt)', 'success');
   } catch (error) {
-    // Ignore second attempt error
+    // Ignore
   }
   
-  // NOW set resetting flag (after gate is closed)
   state.resetting = true;
   
   try {
-    // Stop all automatic processes immediately
     state.autoCycleEnabled = false;
     state.awaitingDetection = false;
     
@@ -963,7 +952,6 @@ async function resetSystemForNextUser(forceStop = false) {
       state.autoPhotoTimer = null;
     }
     
-    // Wait for any in-progress cycle to complete (with timeout)
     if (state.cycleInProgress) {
       const maxWait = 60000;
       const startWait = Date.now();
@@ -973,7 +961,6 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
-    // Stop compactor
     if (forceStop) {
       await stopCompactor();
     } else {
@@ -983,13 +970,11 @@ async function resetSystemForNextUser(forceStop = false) {
       }
     }
     
-    // Stop belt
     await executeCommand('customMotor', CONFIG.motors.belt.stop);
 
   } catch (error) {
     log(`Reset error: ${error.message}`, 'error');
   } finally {
-    // 🔥 CRITICAL: Send session_ended event BEFORE clearing state
     try {
       if (state.sessionCode && state.itemsProcessed >= 0) {
         log(`📤 Notifying backend: Session ended (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
@@ -1011,7 +996,6 @@ async function resetSystemForNextUser(forceStop = false) {
       log(`⚠️ Session end notification error: ${error.message}`, 'warning');
     }
     
-    // NOW clear all state variables
     state.aiResult = null;
     state.weight = null;
     state.sessionId = null;
@@ -1027,7 +1011,6 @@ async function resetSystemForNextUser(forceStop = false) {
     
     clearSessionTimers();
     
-    // 🔥 IMPORTANT: Reset resetting flag LAST
     state.resetting = false;
     state.isReady = true;
     
@@ -1035,7 +1018,6 @@ async function resetSystemForNextUser(forceStop = false) {
     console.log('✅ READY FOR NEXT USER');
     console.log('='.repeat(50) + '\n');
     
-    // Notify system is ready for next user
     mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
       deviceId: CONFIG.device.id,
       status: 'ready',
@@ -1066,7 +1048,6 @@ async function resetSystemForNextUser(forceStop = false) {
 async function handleSessionTimeout(reason) {
   log(`⏱️ Session timeout: ${reason}`, 'warning');
   
-  // 🚨 Close gate IMMEDIATELY on timeout
   log('🚪 Closing gate immediately (timeout)', 'warning');
   try {
     await executeCommand('closeGate');
@@ -1076,13 +1057,12 @@ async function handleSessionTimeout(reason) {
     log(`❌ Gate close error: ${error.message}`, 'error');
   }
   
-  // Try second time for safety
   try {
     await executeCommand('closeGate');
     await delay(300);
     log('✅ Gate close confirmed (second attempt)', 'success');
   } catch (error) {
-    // Ignore second attempt error
+    // Ignore
   }
   
   state.autoCycleEnabled = false;
@@ -1121,7 +1101,6 @@ async function handleSessionTimeout(reason) {
     }
   }
   
-  // 🔥 Force resetting to false before calling reset
   state.resetting = false;
   
   await resetSystemForNextUser(false);
@@ -1234,7 +1213,6 @@ function connectWebSocket() {
         
         mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
         
-        // After AI detection, get weight measurement
         if (state.autoCycleEnabled && state.awaitingDetection) {
           state.awaitingDetection = false;
           log('🔍 AI detection complete - measuring weight...', 'detection');
@@ -1257,18 +1235,17 @@ function connectWebSocket() {
         const binInfo = binStatusMap[binCode];
         
         if (binInfo) {
-          // Skip object sensor processing since it's disabled
           if (binInfo.isObjectSensor) {
             return;
           }
           
-          // Handle bin full warnings
           log(`⚠️ ${binInfo.name} bin full`, 'warning');
           
           if (binInfo.key) {
             state.binStatus[binInfo.key] = true;
           }
           
+          // ✅ PUBLISH WITH RETAIN FLAG
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binCode: binCode,
@@ -1278,7 +1255,10 @@ function connectWebSocket() {
             critical: binInfo.critical,
             binStatus: state.binStatus,
             timestamp: new Date().toISOString()
-          }));
+          }), { 
+            qos: 1,
+            retain: true
+          });
           
           mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -1316,7 +1296,6 @@ function connectWebSocket() {
         
         mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
         
-        // If we have AI result, this is the final weight after photo - process the cycle
         if (state.aiResult && state.autoCycleEnabled && !state.cycleInProgress) {
           log(`⚖️ Final weight: ${state.weight.weight}g`, 'info');
           
@@ -1431,6 +1410,91 @@ mqttClient.on('message', async (topic, message) => {
     }
     
     if (topic === CONFIG.mqtt.topics.commands) {
+      
+      // ✅ NEW: getBinStatus command
+      if (payload.action === 'getBinStatus') {
+        log('📊 Bin status requested', 'info');
+        
+        mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
+          deviceId: CONFIG.device.id,
+          binStatus: state.binStatus,
+          timestamp: new Date().toISOString()
+        }), { 
+          qos: 1, 
+          retain: true 
+        });
+        
+        return;
+      }
+      
+      // ✅ NEW: resetBinStatus command
+      if (payload.action === 'resetBinStatus') {
+        log('🗑️ Resetting bin status', 'info');
+        
+        const params = payload.params || {};
+        
+        if (params.resetAll) {
+          state.binStatus.plastic = false;
+          state.binStatus.metal = false;
+          state.binStatus.right = false;
+          state.binStatus.glass = false;
+          log('✅ All bins reset', 'success');
+        } else if (params.binCode !== undefined) {
+          const binMap = { 0: 'plastic', 1: 'metal', 2: 'right', 3: 'glass' };
+          const binKey = binMap[params.binCode];
+          
+          if (binKey) {
+            state.binStatus[binKey] = false;
+            log(`✅ ${binKey} bin reset`, 'success');
+          }
+        }
+        
+        mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
+          deviceId: CONFIG.device.id,
+          action: 'reset',
+          binStatus: state.binStatus,
+          timestamp: new Date().toISOString()
+        }), { 
+          qos: 1, 
+          retain: true 
+        });
+        
+        return;
+      }
+      
+      // ✅ NEW: testBinFull command
+      if (payload.action === 'testBinFull') {
+        const binCode = payload.params?.binCode || 0;
+        
+        const binStatusMap = {
+          0: { name: 'Plastic (PET)', key: 'plastic' },
+          1: { name: 'Metal Can', key: 'metal' }
+        };
+        
+        const binInfo = binStatusMap[binCode];
+        
+        if (binInfo && binInfo.key) {
+          state.binStatus[binInfo.key] = true;
+          
+          mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
+            deviceId: CONFIG.device.id,
+            binCode: binCode,
+            binName: binInfo.name,
+            binKey: binInfo.key,
+            isFull: true,
+            binStatus: state.binStatus,
+            timestamp: new Date().toISOString()
+          }), { 
+            qos: 1,
+            retain: true 
+          });
+          
+          log(`🧪 TEST: Marked ${binInfo.name} bin as full`, 'warning');
+        }
+        
+        return;
+      }
+      
       if (payload.action === 'getStatus') {
         mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
           deviceId: CONFIG.device.id,
@@ -1479,7 +1543,6 @@ mqttClient.on('message', async (topic, message) => {
         console.log('🛑 END SESSION COMMAND RECEIVED');
         console.log('🚨'.repeat(25) + '\n');
         
-        // 🔥 CRITICAL: Stop auto cycle FIRST before anything else
         state.autoCycleEnabled = false;
         state.awaitingDetection = false;
         
@@ -1488,7 +1551,6 @@ mqttClient.on('message', async (topic, message) => {
           state.autoPhotoTimer = null;
         }
         
-        // 🚨 SUPER AGGRESSIVE: Close gate IMMEDIATELY with retries
         log('🚪 IMMEDIATE GATE CLOSE - Attempt 1', 'warning');
         try {
           await executeCommand('closeGate');
@@ -1498,7 +1560,6 @@ mqttClient.on('message', async (topic, message) => {
           log(`❌ Gate close attempt 1 failed: ${error.message}`, 'error');
         }
         
-        // Second attempt for absolute certainty
         log('🚪 IMMEDIATE GATE CLOSE - Attempt 2 (safety)', 'warning');
         try {
           await executeCommand('closeGate');
@@ -1510,41 +1571,14 @@ mqttClient.on('message', async (topic, message) => {
         
         console.log('✅ Gate closing commands sent - proceeding with reset\n');
         
-        // 🔥 FORCE reset flag to false so resetSystemForNextUser doesn't skip
         state.resetting = false;
         
-        // Now proceed with reset
         await resetSystemForNextUser(false);
         return;
       }
       
       if (payload.action === 'runDiagnostics') {
         runDiagnostics();
-        return;
-      }
-      
-      if (payload.action === 'getBinStatus') {
-        mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
-          deviceId: CONFIG.device.id,
-          binStatus: state.binStatus,
-          timestamp: new Date().toISOString()
-        }));
-        return;
-      }
-      
-      if (payload.action === 'resetBinStatus') {
-        state.binStatus.plastic = false;
-        state.binStatus.metal = false;
-        state.binStatus.right = false;
-        state.binStatus.glass = false;
-        
-        mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
-          deviceId: CONFIG.device.id,
-          action: 'reset',
-          binStatus: state.binStatus,
-          timestamp: new Date().toISOString()
-        }));
-        
         return;
       }
       
@@ -1612,11 +1646,12 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE - GATE FIX v2');
+console.log('🚀 RVM AGENT - GUEST MODE - BIN STATUS FIXED');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');
-console.log('✅ Gate closes IMMEDIATELY on session end - FIXED');
+console.log('✅ Gate closes IMMEDIATELY on session end');
+console.log('✅ Bin status tracking with retain flag');
 console.log('='.repeat(50) + '\n');

@@ -1,4 +1,4 @@
-// agent-guest-only.js - COMPLETE UPDATED VERSION WITH BIN STATUS FIX
+// agent-guest-only.js - COMPLETE FULL VERSION WITH MOTOR HEALTH
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -38,7 +38,9 @@ const CONFIG = {
       status: 'rvm/RVM-3101/status',
       screenState: 'rvm/RVM-3101/screen/state',
       guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status'
+      binStatus: 'rvm/RVM-3101/bin/status',
+      healthMotors: 'rvm/RVM-3101/health/motors',      // 🔧 MOTOR HEALTH
+      motorAbnormal: 'rvm/RVM-3101/motor/abnormal'     // 🔧 MOTOR ABNORMAL
     }
   },
   
@@ -452,7 +454,7 @@ const heartbeat = {
         
         if (!state.isReady) {
           state.isReady = true;
-          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
+          log('✅ System ready - Guest mode with Motor Health', 'success');
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -462,6 +464,7 @@ const heartbeat = {
             isReady: true,
             mode: 'guest_only',
             sensorEnabled: false,
+            motorHealthEnabled: true,
             timestamp
           }));
           
@@ -472,7 +475,6 @@ const heartbeat = {
             timestamp
           }));
           
-          // ✅ PUBLISH INITIAL BIN STATUS
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binStatus: state.binStatus,
@@ -503,6 +505,7 @@ const heartbeat = {
       detectionStats: state.detectionStats,
       mode: 'guest_only',
       sensorEnabled: false,
+      motorHealthEnabled: true,
       timestamp
     }));
     
@@ -532,7 +535,7 @@ async function requestModuleId() {
 // ============================================
 function runDiagnostics() {
   console.log('\n' + '='.repeat(60));
-  console.log('🔬 SYSTEM DIAGNOSTICS - GUEST MODE');
+  console.log('🔬 SYSTEM DIAGNOSTICS - GUEST MODE WITH MOTOR HEALTH');
   console.log('='.repeat(60));
   
   console.log('\n👁️ Object Detection:');
@@ -550,6 +553,12 @@ function runDiagnostics() {
   console.log(`   Metal (Middle): ${state.binStatus.metal ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Right Bin: ${state.binStatus.right ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Glass: ${state.binStatus.glass ? '❌ FULL' : '✅ OK'}`);
+  
+  console.log('\n🔧 Motor Health Monitoring:');
+  console.log(`   Status published to: ${CONFIG.mqtt.topics.healthMotors}`);
+  console.log(`   Alerts published to: ${CONFIG.mqtt.topics.motorAbnormal}`);
+  console.log(`   Hardware reports via WebSocket function "03"`);
+  console.log(`   Normal state: 0 | Abnormal state: 1`);
   
   console.log('\n🎯 System:');
   console.log(`   isReady: ${state.isReady}`);
@@ -1143,7 +1152,7 @@ function clearSessionTimers() {
 }
 
 // ============================================
-// WEBSOCKET
+// WEBSOCKET - WITH MOTOR HEALTH DETECTION
 // ============================================
 function connectWebSocket() {
   if (state.ws) {
@@ -1176,7 +1185,7 @@ function connectWebSocket() {
         
         if (!state.isReady) {
           state.isReady = true;
-          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
+          log('✅ System ready - Guest mode with Motor Health', 'success');
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -1185,6 +1194,7 @@ function connectWebSocket() {
             isReady: true,
             mode: 'guest_only',
             sensorEnabled: false,
+            motorHealthEnabled: true,
             timestamp: new Date().toISOString()
           }));
           
@@ -1245,7 +1255,6 @@ function connectWebSocket() {
             state.binStatus[binInfo.key] = true;
           }
           
-          // ✅ PUBLISH WITH RETAIN FLAG
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binCode: binCode,
@@ -1277,6 +1286,77 @@ function connectWebSocket() {
               }, 2000);
             }
           }
+        }
+        
+        return;
+      }
+      
+      // 🔧 MOTOR HEALTH DETECTION - FUNCTION '03'
+      if (message.function === '03') {
+        try {
+          const abnormalData = typeof message.data === 'string' 
+            ? JSON.parse(message.data) 
+            : message.data;
+          
+          console.log('🔧 Motor status data received:', abnormalData);
+          
+          if (Array.isArray(abnormalData)) {
+            const abnormalMotors = [];
+            
+            abnormalData.forEach(motor => {
+              const motorNameMap = {
+                '01': 'Gate Motor',
+                '02': 'Belt Motor',
+                '04': 'Compactor Motor',
+                '09': 'Stepper Motor'
+              };
+              
+              const motorName = motorNameMap[motor.motorType] || `Motor ${motor.motorType}`;
+              
+              // Always publish motor status to MQTT
+              mqttClient.publish(CONFIG.mqtt.topics.healthMotors, JSON.stringify({
+                deviceId: CONFIG.device.id,
+                motorType: motor.motorType,
+                motorId: motor.motorType,
+                motorName: motorName,
+                status: motor.state === 1 ? 'abnormal' : 'operational',
+                isAbnormal: motor.state === 1,
+                position: motor.position,
+                positionDesc: motor.positionDesc,
+                timestamp: new Date().toISOString()
+              }), { qos: 1 });
+              
+              // If abnormal, log and collect
+              if (motor.state === 1) {
+                abnormalMotors.push({
+                  motorType: motor.motorType,
+                  motorName: motorName,
+                  state: 'abnormal',
+                  position: motor.position,
+                  positionDesc: motor.positionDesc,
+                  motorTypeDesc: motor.motorTypeDesc
+                });
+                
+                log(`🚨 MOTOR ABNORMAL: ${motorName} (${motor.motorType}) - Position: ${motor.positionDesc || motor.position}`, 'error');
+              } else {
+                log(`✅ MOTOR OK: ${motorName} (${motor.motorType})`, 'success');
+              }
+            });
+            
+            // If any abnormal motors, publish consolidated alert
+            if (abnormalMotors.length > 0) {
+              mqttClient.publish(CONFIG.mqtt.topics.motorAbnormal, JSON.stringify({
+                deviceId: CONFIG.device.id,
+                motors: abnormalMotors,
+                count: abnormalMotors.length,
+                timestamp: new Date().toISOString()
+              }), { qos: 1 });
+              
+              log(`🚨 ${abnormalMotors.length} motor(s) in abnormal state`, 'error');
+            }
+          }
+        } catch (error) {
+          log(`Error parsing motor status data: ${error.message}`, 'error');
         }
         
         return;
@@ -1370,6 +1450,7 @@ mqttClient.on('connect', () => {
     event: 'device_connected',
     mode: 'guest_only',
     sensorEnabled: false,
+    motorHealthEnabled: true,
     timestamp: new Date().toISOString()
   }), { retain: true });
   
@@ -1380,6 +1461,7 @@ mqttClient.on('connect', () => {
     isReady: true,
     mode: 'guest_only',
     sensorEnabled: false,
+    motorHealthEnabled: true,
     timestamp: new Date().toISOString()
   }));
   
@@ -1411,7 +1493,6 @@ mqttClient.on('message', async (topic, message) => {
     
     if (topic === CONFIG.mqtt.topics.commands) {
       
-      // ✅ NEW: getBinStatus command
       if (payload.action === 'getBinStatus') {
         log('📊 Bin status requested', 'info');
         
@@ -1427,7 +1508,6 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
-      // ✅ NEW: resetBinStatus command
       if (payload.action === 'resetBinStatus') {
         log('🗑️ Resetting bin status', 'info');
         
@@ -1462,7 +1542,6 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
-      // ✅ NEW: testBinFull command
       if (payload.action === 'testBinFull') {
         const binCode = payload.params?.binCode || 0;
         
@@ -1486,7 +1565,7 @@ mqttClient.on('message', async (topic, message) => {
             timestamp: new Date().toISOString()
           }), { 
             qos: 1,
-            retain: true 
+            retain: true
           });
           
           log(`🧪 TEST: Marked ${binInfo.name} bin as full`, 'warning');
@@ -1508,6 +1587,7 @@ mqttClient.on('message', async (topic, message) => {
           detectionStats: state.detectionStats,
           mode: 'guest_only',
           sensorEnabled: false,
+          motorHealthEnabled: true,
           timestamp: new Date().toISOString()
         }));
         
@@ -1646,12 +1726,11 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE - BIN STATUS FIXED');
+console.log('🚀 RVM AGENT - COMPLETE WITH MOTOR HEALTH');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
-console.log('Object Sensor: DISABLED (automatic belt movement)');
-console.log('Session timeout: 5 minutes inactivity');
+console.log('✅ Motor Health Monitoring ENABLED');
+console.log('✅ Bin Status Tracking ENABLED');
 console.log('✅ Gate closes IMMEDIATELY on session end');
-console.log('✅ Bin status tracking with retain flag');
 console.log('='.repeat(50) + '\n');

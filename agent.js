@@ -398,6 +398,14 @@ async function scheduleNextPhotoWithPositioning() {
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
+      // ✅ FIX: Ensure belt is fully stopped before weight check
+      try {
+        await executeCommand('customMotor', CONFIG.motors.belt.stop);
+        await delay(CONFIG.timing.positionSettle);
+      } catch (error) {
+        log(`Belt pre-stop error: ${error.message}`, 'error');
+      }
+      
       log('🔍 Checking weight for item presence...', 'info');
       
       try {
@@ -432,6 +440,11 @@ async function scheduleNextPhotoWithPositioning() {
       
       try {
         if (CONFIG.detection.positionBeforePhoto) {
+          // ✅ FIX: Explicit belt stop + settle before positioning
+          log('🛑 Ensuring belt is stopped before positioning...', 'debug');
+          await executeCommand('customMotor', CONFIG.motors.belt.stop);
+          await delay(CONFIG.timing.positionSettle);
+          
           log('🔄 [STEP 1] Moving belt to camera position...', 'info');
           log(`⏱️ Belt will run for ${CONFIG.timing.beltToWeight}ms`, 'debug');
           
@@ -454,12 +467,11 @@ async function scheduleNextPhotoWithPositioning() {
         log('📸 Photo command sent - waiting for AI result...', 'camera');
         
       } catch (error) {
-        log(`❌ Photo positioning error at step: ${error.message}`, 'error');
+        log(`❌ Photo positioning error: ${error.message}`, 'error');
         state.awaitingDetection = false;
         state.itemAlreadyPositioned = false;
         state.weight = null;
         
-        // Stop belt in case it's still running
         try {
           await executeCommand('customMotor', CONFIG.motors.belt.stop);
           log('🛑 Belt stopped after error', 'warning');
@@ -471,8 +483,6 @@ async function scheduleNextPhotoWithPositioning() {
           await scheduleNextPhotoWithPositioning();
         }
       }
-    } else {
-      log(`⏭️ Skipping photo: autoCycle=${state.autoCycleEnabled}, cycleInProgress=${state.cycleInProgress}, awaitingDetection=${state.awaitingDetection}`, 'debug');
     }
   }, 500);
 }

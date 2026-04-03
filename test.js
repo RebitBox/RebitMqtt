@@ -1283,7 +1283,7 @@ function connectWebSocket() {
       // ── function "deviceStatus": Bin full ───────────────
       if (message.function === 'deviceStatus') {
         const binCode = parseInt(message.data);
-        
+        console.log(binCode,"bin status codeeee")
         const binStatusMap = {
           0: { name: 'Plastic (PET)', key: 'plastic', critical: true  },
           1: { name: 'Metal Can',     key: 'metal',   critical: true  },

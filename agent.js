@@ -321,6 +321,75 @@ async function stopCompactor() {
 // PHOTO DETECTION WITH POSITIONING (NO SENSOR)
 // ============================================
 
+// async function scheduleNextPhotoWithPositioning() {
+//   if (state.autoPhotoTimer) {
+//     clearTimeout(state.autoPhotoTimer);
+//   }
+  
+//   state.autoPhotoTimer = setTimeout(async () => {
+//     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+      
+//       try {
+//         await executeCommand('getWeight');
+//         await delay(CONFIG.timing.weightDelay);
+        
+//         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
+//           state.weight = null;
+          
+//           if (state.autoCycleEnabled) {
+//             await scheduleNextPhotoWithPositioning();
+//           }
+//           return;
+//         }
+        
+//         log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
+        
+//         state.weight = null;
+        
+//       } catch (error) {
+//         log(`Weight check error: ${error.message}`, 'error');
+        
+//         if (state.autoCycleEnabled) {
+//           await scheduleNextPhotoWithPositioning();
+//         }
+//         return;
+//       }
+      
+//       state.awaitingDetection = true;
+//       state.itemAlreadyPositioned = false;
+      
+//       try {
+//         if (CONFIG.detection.positionBeforePhoto) {
+//           log('🔄 Moving belt to camera position...', 'info');
+          
+//           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
+//           await delay(CONFIG.timing.beltToWeight);
+          
+//           await executeCommand('customMotor', CONFIG.motors.belt.stop);
+//           await delay(CONFIG.timing.photoPositionDelay);
+          
+//           state.itemAlreadyPositioned = true;
+//           log('✅ Item positioned for photo', 'camera');
+//         }
+        
+//         log('📸 Taking photo...', 'camera');
+//         await executeCommand('takePhoto');
+        
+//       } catch (error) {
+//         log(`Photo positioning error: ${error.message}`, 'error');
+//         state.awaitingDetection = false;
+//         state.itemAlreadyPositioned = false;
+//         state.weight = null;
+        
+//         if (state.autoCycleEnabled) {
+//           await scheduleNextPhotoWithPositioning();
+//         }
+//       }
+//     }
+//   }, 500);
+// }
+
+
 async function scheduleNextPhotoWithPositioning() {
   if (state.autoPhotoTimer) {
     clearTimeout(state.autoPhotoTimer);
@@ -329,11 +398,14 @@ async function scheduleNextPhotoWithPositioning() {
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
+      log('🔍 Checking weight for item presence...', 'info');
+      
       try {
         await executeCommand('getWeight');
         await delay(CONFIG.timing.weightDelay);
         
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
+          log(`⚖️ No item detected (weight: ${state.weight ? state.weight.weight + 'g' : 'null'}) - waiting...`, 'debug');
           state.weight = null;
           
           if (state.autoCycleEnabled) {
@@ -342,7 +414,7 @@ async function scheduleNextPhotoWithPositioning() {
           return;
         }
         
-        log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
+        log(`✅ Item detected (${state.weight.weight}g) - proceeding to position`, 'success');
         
         state.weight = null;
         
@@ -360,31 +432,47 @@ async function scheduleNextPhotoWithPositioning() {
       
       try {
         if (CONFIG.detection.positionBeforePhoto) {
-          log('🔄 Moving belt to camera position...', 'info');
+          log('🔄 [STEP 1] Moving belt to camera position...', 'info');
+          log(`⏱️ Belt will run for ${CONFIG.timing.beltToWeight}ms`, 'debug');
           
+          const beltStartTime = Date.now();
           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
           await delay(CONFIG.timing.beltToWeight);
           
+          log(`🛑 [STEP 2] Stopping belt (ran for ${Date.now() - beltStartTime}ms)...`, 'info');
           await executeCommand('customMotor', CONFIG.motors.belt.stop);
-          await delay(CONFIG.timing.photoPositionDelay);
+          
+          log(`⏳ [STEP 3] Waiting ${CONFIG.timing.positionSettle}ms for belt to settle...`, 'debug');
+          await delay(CONFIG.timing.positionSettle);
           
           state.itemAlreadyPositioned = true;
-          log('✅ Item positioned for photo', 'camera');
+          log('✅ [STEP 4] Item positioned at camera - ready for photo', 'camera');
         }
         
-        log('📸 Taking photo...', 'camera');
+        log('📸 [STEP 5] Taking photo...', 'camera');
         await executeCommand('takePhoto');
+        log('📸 Photo command sent - waiting for AI result...', 'camera');
         
       } catch (error) {
-        log(`Photo positioning error: ${error.message}`, 'error');
+        log(`❌ Photo positioning error at step: ${error.message}`, 'error');
         state.awaitingDetection = false;
         state.itemAlreadyPositioned = false;
         state.weight = null;
+        
+        // Stop belt in case it's still running
+        try {
+          await executeCommand('customMotor', CONFIG.motors.belt.stop);
+          log('🛑 Belt stopped after error', 'warning');
+        } catch (stopError) {
+          log(`Belt stop after error failed: ${stopError.message}`, 'error');
+        }
         
         if (state.autoCycleEnabled) {
           await scheduleNextPhotoWithPositioning();
         }
       }
+    } else {
+      log(`⏭️ Skipping photo: autoCycle=${state.autoCycleEnabled}, cycleInProgress=${state.cycleInProgress}, awaitingDetection=${state.awaitingDetection}`, 'debug');
     }
   }, 500);
 }

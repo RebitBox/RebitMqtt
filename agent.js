@@ -10,7 +10,7 @@ const WebSocket = require('ws');
 // ============================================
 const CONFIG = {
   device: {
-    id: 'RVM-3101'
+    id: 'RVM-3102'
   },
   
   backend: {

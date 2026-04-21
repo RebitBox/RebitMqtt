@@ -877,6 +877,10 @@ async function executeAutoCycle() {
 
     await delay(CONFIG.timing.itemDropDelay);
 
+    // ✅ FIX: Reset compactor idle timer AFTER item drops into bin
+    // This gives the compactor time to actually crush the item
+    resetCompactorIdleTimer();
+
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
 

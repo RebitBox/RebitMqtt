@@ -1,4 +1,4 @@
-// agent-guest-only.js - COMPLETE FULL VERSION WITH MOTOR HEALTH
+// agent-guest-only.js - COMPLETE UPDATED VERSION WITH BIN STATUS FIX
 // Object sensor DISABLED for immediate functionality
 const mqtt = require('mqtt');
 const axios = require('axios');
@@ -38,9 +38,7 @@ const CONFIG = {
       status: 'rvm/RVM-3101/status',
       screenState: 'rvm/RVM-3101/screen/state',
       guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status',
-      healthMotors: 'rvm/RVM-3101/health/motors',      // 🔧 MOTOR HEALTH
-      motorAbnormal: 'rvm/RVM-3101/motor/abnormal'     // 🔧 MOTOR ABNORMAL
+      binStatus: 'rvm/RVM-3101/bin/status'
     }
   },
   
@@ -323,6 +321,75 @@ async function stopCompactor() {
 // PHOTO DETECTION WITH POSITIONING (NO SENSOR)
 // ============================================
 
+// async function scheduleNextPhotoWithPositioning() {
+//   if (state.autoPhotoTimer) {
+//     clearTimeout(state.autoPhotoTimer);
+//   }
+  
+//   state.autoPhotoTimer = setTimeout(async () => {
+//     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
+      
+//       try {
+//         await executeCommand('getWeight');
+//         await delay(CONFIG.timing.weightDelay);
+        
+//         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
+//           state.weight = null;
+          
+//           if (state.autoCycleEnabled) {
+//             await scheduleNextPhotoWithPositioning();
+//           }
+//           return;
+//         }
+        
+//         log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
+        
+//         state.weight = null;
+        
+//       } catch (error) {
+//         log(`Weight check error: ${error.message}`, 'error');
+        
+//         if (state.autoCycleEnabled) {
+//           await scheduleNextPhotoWithPositioning();
+//         }
+//         return;
+//       }
+      
+//       state.awaitingDetection = true;
+//       state.itemAlreadyPositioned = false;
+      
+//       try {
+//         if (CONFIG.detection.positionBeforePhoto) {
+//           log('🔄 Moving belt to camera position...', 'info');
+          
+//           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
+//           await delay(CONFIG.timing.beltToWeight);
+          
+//           await executeCommand('customMotor', CONFIG.motors.belt.stop);
+//           await delay(CONFIG.timing.photoPositionDelay);
+          
+//           state.itemAlreadyPositioned = true;
+//           log('✅ Item positioned for photo', 'camera');
+//         }
+        
+//         log('📸 Taking photo...', 'camera');
+//         await executeCommand('takePhoto');
+        
+//       } catch (error) {
+//         log(`Photo positioning error: ${error.message}`, 'error');
+//         state.awaitingDetection = false;
+//         state.itemAlreadyPositioned = false;
+//         state.weight = null;
+        
+//         if (state.autoCycleEnabled) {
+//           await scheduleNextPhotoWithPositioning();
+//         }
+//       }
+//     }
+//   }, 500);
+// }
+
+
 async function scheduleNextPhotoWithPositioning() {
   if (state.autoPhotoTimer) {
     clearTimeout(state.autoPhotoTimer);
@@ -331,11 +398,22 @@ async function scheduleNextPhotoWithPositioning() {
   state.autoPhotoTimer = setTimeout(async () => {
     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
       
+      // ✅ FIX: Ensure belt is fully stopped before weight check
+      try {
+        await executeCommand('customMotor', CONFIG.motors.belt.stop);
+        await delay(CONFIG.timing.positionSettle);
+      } catch (error) {
+        log(`Belt pre-stop error: ${error.message}`, 'error');
+      }
+      
+      log('🔍 Checking weight for item presence...', 'info');
+      
       try {
         await executeCommand('getWeight');
         await delay(CONFIG.timing.weightDelay);
         
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
+          log(`⚖️ No item detected (weight: ${state.weight ? state.weight.weight + 'g' : 'null'}) - waiting...`, 'debug');
           state.weight = null;
           
           if (state.autoCycleEnabled) {
@@ -344,7 +422,7 @@ async function scheduleNextPhotoWithPositioning() {
           return;
         }
         
-        log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
+        log(`✅ Item detected (${state.weight.weight}g) - proceeding to position`, 'success');
         
         state.weight = null;
         
@@ -362,26 +440,44 @@ async function scheduleNextPhotoWithPositioning() {
       
       try {
         if (CONFIG.detection.positionBeforePhoto) {
-          log('🔄 Moving belt to camera position...', 'info');
+          // ✅ FIX: Explicit belt stop + settle before positioning
+          log('🛑 Ensuring belt is stopped before positioning...', 'debug');
+          await executeCommand('customMotor', CONFIG.motors.belt.stop);
+          await delay(CONFIG.timing.positionSettle);
           
+          log('🔄 [STEP 1] Moving belt to camera position...', 'info');
+          log(`⏱️ Belt will run for ${CONFIG.timing.beltToWeight}ms`, 'debug');
+          
+          const beltStartTime = Date.now();
           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
           await delay(CONFIG.timing.beltToWeight);
           
+          log(`🛑 [STEP 2] Stopping belt (ran for ${Date.now() - beltStartTime}ms)...`, 'info');
           await executeCommand('customMotor', CONFIG.motors.belt.stop);
-          await delay(CONFIG.timing.photoPositionDelay);
+          
+          log(`⏳ [STEP 3] Waiting ${CONFIG.timing.positionSettle}ms for belt to settle...`, 'debug');
+          await delay(CONFIG.timing.positionSettle);
           
           state.itemAlreadyPositioned = true;
-          log('✅ Item positioned for photo', 'camera');
+          log('✅ [STEP 4] Item positioned at camera - ready for photo', 'camera');
         }
         
-        log('📸 Taking photo...', 'camera');
+        log('📸 [STEP 5] Taking photo...', 'camera');
         await executeCommand('takePhoto');
+        log('📸 Photo command sent - waiting for AI result...', 'camera');
         
       } catch (error) {
-        log(`Photo positioning error: ${error.message}`, 'error');
+        log(`❌ Photo positioning error: ${error.message}`, 'error');
         state.awaitingDetection = false;
         state.itemAlreadyPositioned = false;
         state.weight = null;
+        
+        try {
+          await executeCommand('customMotor', CONFIG.motors.belt.stop);
+          log('🛑 Belt stopped after error', 'warning');
+        } catch (stopError) {
+          log(`Belt stop after error failed: ${stopError.message}`, 'error');
+        }
         
         if (state.autoCycleEnabled) {
           await scheduleNextPhotoWithPositioning();
@@ -454,7 +550,7 @@ const heartbeat = {
         
         if (!state.isReady) {
           state.isReady = true;
-          log('✅ System ready - Guest mode with Motor Health', 'success');
+          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -464,7 +560,6 @@ const heartbeat = {
             isReady: true,
             mode: 'guest_only',
             sensorEnabled: false,
-            motorHealthEnabled: true,
             timestamp
           }));
           
@@ -475,6 +570,7 @@ const heartbeat = {
             timestamp
           }));
           
+          // ✅ PUBLISH INITIAL BIN STATUS
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binStatus: state.binStatus,
@@ -505,7 +601,6 @@ const heartbeat = {
       detectionStats: state.detectionStats,
       mode: 'guest_only',
       sensorEnabled: false,
-      motorHealthEnabled: true,
       timestamp
     }));
     
@@ -535,7 +630,7 @@ async function requestModuleId() {
 // ============================================
 function runDiagnostics() {
   console.log('\n' + '='.repeat(60));
-  console.log('🔬 SYSTEM DIAGNOSTICS - GUEST MODE WITH MOTOR HEALTH');
+  console.log('🔬 SYSTEM DIAGNOSTICS - GUEST MODE');
   console.log('='.repeat(60));
   
   console.log('\n👁️ Object Detection:');
@@ -553,12 +648,6 @@ function runDiagnostics() {
   console.log(`   Metal (Middle): ${state.binStatus.metal ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Right Bin: ${state.binStatus.right ? '❌ FULL' : '✅ OK'}`);
   console.log(`   Glass: ${state.binStatus.glass ? '❌ FULL' : '✅ OK'}`);
-  
-  console.log('\n🔧 Motor Health Monitoring:');
-  console.log(`   Status published to: ${CONFIG.mqtt.topics.healthMotors}`);
-  console.log(`   Alerts published to: ${CONFIG.mqtt.topics.motorAbnormal}`);
-  console.log(`   Hardware reports via WebSocket function "03"`);
-  console.log(`   Normal state: 0 | Abnormal state: 1`);
   
   console.log('\n🎯 System:');
   console.log(`   isReady: ${state.isReady}`);
@@ -1152,7 +1241,7 @@ function clearSessionTimers() {
 }
 
 // ============================================
-// WEBSOCKET - WITH MOTOR HEALTH DETECTION
+// WEBSOCKET
 // ============================================
 function connectWebSocket() {
   if (state.ws) {
@@ -1185,7 +1274,7 @@ function connectWebSocket() {
         
         if (!state.isReady) {
           state.isReady = true;
-          log('✅ System ready - Guest mode with Motor Health', 'success');
+          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
           
           mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
             deviceId: CONFIG.device.id,
@@ -1194,7 +1283,6 @@ function connectWebSocket() {
             isReady: true,
             mode: 'guest_only',
             sensorEnabled: false,
-            motorHealthEnabled: true,
             timestamp: new Date().toISOString()
           }));
           
@@ -1255,6 +1343,7 @@ function connectWebSocket() {
             state.binStatus[binInfo.key] = true;
           }
           
+          // ✅ PUBLISH WITH RETAIN FLAG
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id,
             binCode: binCode,
@@ -1286,77 +1375,6 @@ function connectWebSocket() {
               }, 2000);
             }
           }
-        }
-        
-        return;
-      }
-      
-      // 🔧 MOTOR HEALTH DETECTION - FUNCTION '03'
-      if (message.function === '03') {
-        try {
-          const abnormalData = typeof message.data === 'string' 
-            ? JSON.parse(message.data) 
-            : message.data;
-          
-          console.log('🔧 Motor status data received:', abnormalData);
-          
-          if (Array.isArray(abnormalData)) {
-            const abnormalMotors = [];
-            
-            abnormalData.forEach(motor => {
-              const motorNameMap = {
-                '01': 'Gate Motor',
-                '02': 'Belt Motor',
-                '04': 'Compactor Motor',
-                '09': 'Stepper Motor'
-              };
-              
-              const motorName = motorNameMap[motor.motorType] || `Motor ${motor.motorType}`;
-              
-              // Always publish motor status to MQTT
-              mqttClient.publish(CONFIG.mqtt.topics.healthMotors, JSON.stringify({
-                deviceId: CONFIG.device.id,
-                motorType: motor.motorType,
-                motorId: motor.motorType,
-                motorName: motorName,
-                status: motor.state === 1 ? 'abnormal' : 'operational',
-                isAbnormal: motor.state === 1,
-                position: motor.position,
-                positionDesc: motor.positionDesc,
-                timestamp: new Date().toISOString()
-              }), { qos: 1 });
-              
-              // If abnormal, log and collect
-              if (motor.state === 1) {
-                abnormalMotors.push({
-                  motorType: motor.motorType,
-                  motorName: motorName,
-                  state: 'abnormal',
-                  position: motor.position,
-                  positionDesc: motor.positionDesc,
-                  motorTypeDesc: motor.motorTypeDesc
-                });
-                
-                log(`🚨 MOTOR ABNORMAL: ${motorName} (${motor.motorType}) - Position: ${motor.positionDesc || motor.position}`, 'error');
-              } else {
-                log(`✅ MOTOR OK: ${motorName} (${motor.motorType})`, 'success');
-              }
-            });
-            
-            // If any abnormal motors, publish consolidated alert
-            if (abnormalMotors.length > 0) {
-              mqttClient.publish(CONFIG.mqtt.topics.motorAbnormal, JSON.stringify({
-                deviceId: CONFIG.device.id,
-                motors: abnormalMotors,
-                count: abnormalMotors.length,
-                timestamp: new Date().toISOString()
-              }), { qos: 1 });
-              
-              log(`🚨 ${abnormalMotors.length} motor(s) in abnormal state`, 'error');
-            }
-          }
-        } catch (error) {
-          log(`Error parsing motor status data: ${error.message}`, 'error');
         }
         
         return;
@@ -1450,7 +1468,6 @@ mqttClient.on('connect', () => {
     event: 'device_connected',
     mode: 'guest_only',
     sensorEnabled: false,
-    motorHealthEnabled: true,
     timestamp: new Date().toISOString()
   }), { retain: true });
   
@@ -1461,7 +1478,6 @@ mqttClient.on('connect', () => {
     isReady: true,
     mode: 'guest_only',
     sensorEnabled: false,
-    motorHealthEnabled: true,
     timestamp: new Date().toISOString()
   }));
   
@@ -1493,6 +1509,7 @@ mqttClient.on('message', async (topic, message) => {
     
     if (topic === CONFIG.mqtt.topics.commands) {
       
+      // ✅ NEW: getBinStatus command
       if (payload.action === 'getBinStatus') {
         log('📊 Bin status requested', 'info');
         
@@ -1508,6 +1525,7 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
+      // ✅ NEW: resetBinStatus command
       if (payload.action === 'resetBinStatus') {
         log('🗑️ Resetting bin status', 'info');
         
@@ -1542,6 +1560,7 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
+      // ✅ NEW: testBinFull command
       if (payload.action === 'testBinFull') {
         const binCode = payload.params?.binCode || 0;
         
@@ -1565,7 +1584,7 @@ mqttClient.on('message', async (topic, message) => {
             timestamp: new Date().toISOString()
           }), { 
             qos: 1,
-            retain: true
+            retain: true 
           });
           
           log(`🧪 TEST: Marked ${binInfo.name} bin as full`, 'warning');
@@ -1587,7 +1606,6 @@ mqttClient.on('message', async (topic, message) => {
           detectionStats: state.detectionStats,
           mode: 'guest_only',
           sensorEnabled: false,
-          motorHealthEnabled: true,
           timestamp: new Date().toISOString()
         }));
         
@@ -1726,11 +1744,12 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - COMPLETE WITH MOTOR HEALTH');
+console.log('🚀 RVM AGENT - GUEST MODE - BIN STATUS FIXED');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log('Mode: Guest users only');
-console.log('✅ Motor Health Monitoring ENABLED');
-console.log('✅ Bin Status Tracking ENABLED');
+console.log('Object Sensor: DISABLED (automatic belt movement)');
+console.log('Session timeout: 5 minutes inactivity');
 console.log('✅ Gate closes IMMEDIATELY on session end');
+console.log('✅ Bin status tracking with retain flag');
 console.log('='.repeat(50) + '\n');

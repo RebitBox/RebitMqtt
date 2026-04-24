@@ -3,14 +3,36 @@
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
+const path = require('path');
 const WebSocket = require('ws');
+
+// ============================================
+// LOAD MACHINE CONFIG
+// ============================================
+const machineConfigPath = path.join('C:\\Users\\YY', 'machine-config.json');
+
+if (!fs.existsSync(machineConfigPath)) {
+  console.error(`❌ Config file not found: ${machineConfigPath}`);
+  console.error('Please create machine-config.json with: { "deviceId": "RVM-XXXX" }');
+  process.exit(1);
+}
+
+const machineConfig = JSON.parse(fs.readFileSync(machineConfigPath, 'utf8'));
+const DEVICE_ID = machineConfig.deviceId;
+
+if (!DEVICE_ID) {
+  console.error('❌ deviceId not found in machine-config.json');
+  process.exit(1);
+}
+
+console.log(`✅ Device ID loaded: ${DEVICE_ID}`);
 
 // ============================================
 // CONFIGURATION
 // ============================================
 const CONFIG = {
   device: {
-    id: 'RVM-3101'
+    id: DEVICE_ID
   },
   
   backend: {
@@ -30,15 +52,15 @@ const CONFIG = {
     password: '2o25@pR0Du$3rW8tl',
     caFile: 'C:\\Users\\YY\\RebitMqtt\\certs/app.rebit-japan.com.ca-bundle',
     topics: {
-      commands: 'rvm/RVM-3101/commands',
-      autoControl: 'rvm/RVM-3101/control/auto',
-      cycleComplete: 'rvm/RVM-3101/cycle/complete',
-      aiResult: 'rvm/RVM-3101/ai/result',
-      weightResult: 'rvm/RVM-3101/weight/result',
-      status: 'rvm/RVM-3101/status',
-      screenState: 'rvm/RVM-3101/screen/state',
-      guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status'
+      commands: `rvm/${DEVICE_ID}/commands`,
+      autoControl: `rvm/${DEVICE_ID}/control/auto`,
+      cycleComplete: `rvm/${DEVICE_ID}/cycle/complete`,
+      aiResult: `rvm/${DEVICE_ID}/ai/result`,
+      weightResult: `rvm/${DEVICE_ID}/weight/result`,
+      status: `rvm/${DEVICE_ID}/status`,
+      screenState: `rvm/${DEVICE_ID}/screen/state`,
+      guestStart: `rvm/${DEVICE_ID}/guest/start`,
+      binStatus: `rvm/${DEVICE_ID}/bin/status`
     }
   },
   
@@ -321,75 +343,6 @@ async function stopCompactor() {
 // PHOTO DETECTION WITH POSITIONING (NO SENSOR)
 // ============================================
 
-// async function scheduleNextPhotoWithPositioning() {
-//   if (state.autoPhotoTimer) {
-//     clearTimeout(state.autoPhotoTimer);
-//   }
-  
-//   state.autoPhotoTimer = setTimeout(async () => {
-//     if (state.autoCycleEnabled && !state.cycleInProgress && !state.awaitingDetection) {
-      
-//       try {
-//         await executeCommand('getWeight');
-//         await delay(CONFIG.timing.weightDelay);
-        
-//         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
-//           state.weight = null;
-          
-//           if (state.autoCycleEnabled) {
-//             await scheduleNextPhotoWithPositioning();
-//           }
-//           return;
-//         }
-        
-//         log(`✅ Item detected (${state.weight.weight}g) - proceeding immediately`, 'success');
-        
-//         state.weight = null;
-        
-//       } catch (error) {
-//         log(`Weight check error: ${error.message}`, 'error');
-        
-//         if (state.autoCycleEnabled) {
-//           await scheduleNextPhotoWithPositioning();
-//         }
-//         return;
-//       }
-      
-//       state.awaitingDetection = true;
-//       state.itemAlreadyPositioned = false;
-      
-//       try {
-//         if (CONFIG.detection.positionBeforePhoto) {
-//           log('🔄 Moving belt to camera position...', 'info');
-          
-//           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
-//           await delay(CONFIG.timing.beltToWeight);
-          
-//           await executeCommand('customMotor', CONFIG.motors.belt.stop);
-//           await delay(CONFIG.timing.photoPositionDelay);
-          
-//           state.itemAlreadyPositioned = true;
-//           log('✅ Item positioned for photo', 'camera');
-//         }
-        
-//         log('📸 Taking photo...', 'camera');
-//         await executeCommand('takePhoto');
-        
-//       } catch (error) {
-//         log(`Photo positioning error: ${error.message}`, 'error');
-//         state.awaitingDetection = false;
-//         state.itemAlreadyPositioned = false;
-//         state.weight = null;
-        
-//         if (state.autoCycleEnabled) {
-//           await scheduleNextPhotoWithPositioning();
-//         }
-//       }
-//     }
-//   }, 500);
-// }
-
-
 async function scheduleNextPhotoWithPositioning() {
   if (state.autoPhotoTimer) {
     clearTimeout(state.autoPhotoTimer);
@@ -650,6 +603,7 @@ function runDiagnostics() {
   console.log(`   Glass: ${state.binStatus.glass ? '❌ FULL' : '✅ OK'}`);
   
   console.log('\n🎯 System:');
+  console.log(`   deviceId: ${CONFIG.device.id}`);
   console.log(`   isReady: ${state.isReady}`);
   console.log(`   autoCycle: ${state.autoCycleEnabled}`);
   console.log(`   resetting: ${state.resetting}`);
@@ -851,7 +805,7 @@ async function executeRejectionCycle() {
     
     trackDetectionAttempt(false, state.detectionRetries);
 
-    mqttClient.publish('rvm/RVM-3101/item/rejected', JSON.stringify({
+    mqttClient.publish(`rvm/${DEVICE_ID}/item/rejected`, JSON.stringify({
       deviceId: CONFIG.device.id,
       reason: 'LOW_CONFIDENCE',
       sessionCode: state.sessionCode,
@@ -922,6 +876,10 @@ async function executeAutoCycle() {
     await delay(CONFIG.timing.stepperRotate);
 
     await delay(CONFIG.timing.itemDropDelay);
+
+    // ✅ FIX: Reset compactor idle timer AFTER item drops into bin
+    // This gives the compactor time to actually crush the item
+    resetCompactorIdleTimer();
 
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
@@ -1747,6 +1705,7 @@ console.log('='.repeat(50));
 console.log('🚀 RVM AGENT - GUEST MODE - BIN STATUS FIXED');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
+console.log(`Config: ${machineConfigPath}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');

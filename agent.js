@@ -860,6 +860,10 @@ async function executeAutoCycle() {
   
   log(`⚡ Item #${state.itemsProcessed}: ${cycleData.material} (${cycleData.weight}g)`, 'success');
 
+  // ✅ PUBLISH CYCLE COMPLETE IMMEDIATELY - before motors run
+  // Backend can start DB writes while motors are moving
+  mqttClient.publish(CONFIG.mqtt.topics.cycleComplete, JSON.stringify(cycleData));
+
   try {
     await startContinuousCompactor();
     
@@ -877,14 +881,12 @@ async function executeAutoCycle() {
 
     await delay(CONFIG.timing.itemDropDelay);
 
-    // ✅ FIX: Reset compactor idle timer AFTER item drops into bin
-    // This gives the compactor time to actually crush the item
     resetCompactorIdleTimer();
 
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
 
-    mqttClient.publish(CONFIG.mqtt.topics.cycleComplete, JSON.stringify(cycleData));
+    // ✅ REMOVED: mqttClient.publish was here before — now it's at the top
 
     trackCycleTime(cycleStartTime);
     resetInactivityTimer();
@@ -904,7 +906,6 @@ async function executeAutoCycle() {
     await scheduleNextPhotoWithPositioning();
   }
 }
-
 // ============================================
 // GUEST SESSION MANAGEMENT
 // ============================================

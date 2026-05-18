@@ -131,7 +131,7 @@ const CONFIG = {
 // ============================================
 // HARDCODED MODULE ID
 // ============================================
-const HARDCODED_MODULE_ID = '9';
+const HARDCODED_MODULE_ID = '09';
 
 // ============================================
 // STATE MANAGEMENT

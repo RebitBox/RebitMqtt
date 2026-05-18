@@ -1,5 +1,6 @@
 // agent-guest-only.js - COMPLETE UPDATED VERSION WITH BIN STATUS FIX
 // Object sensor DISABLED for immediate functionality
+// Module ID HARDCODED to 9
 const mqtt = require('mqtt');
 const axios = require('axios');
 const fs = require('fs');
@@ -119,7 +120,6 @@ const CONFIG = {
   
   heartbeat: {
     interval: 30,
-    maxModuleIdRetries: 10,
     stateCheckInterval: 30
   },
   
@@ -129,10 +129,15 @@ const CONFIG = {
 };
 
 // ============================================
+// HARDCODED MODULE ID
+// ============================================
+const HARDCODED_MODULE_ID = '9';
+
+// ============================================
 // STATE MANAGEMENT
 // ============================================
 const state = {
-  moduleId: null,
+  moduleId: HARDCODED_MODULE_ID,  // ✅ Hardcoded to 9
   aiResult: null,
   weight: null,
   autoCycleEnabled: false,
@@ -457,8 +462,6 @@ const heartbeat = {
   interval: null,
   stateCheckInterval: null,
   timeout: CONFIG.heartbeat.interval,
-  moduleIdRetries: 0,
-  maxModuleIdRetries: CONFIG.heartbeat.maxModuleIdRetries,
   
   start() {
     if (this.interval) {
@@ -493,51 +496,6 @@ const heartbeat = {
   async beat() {
     const timestamp = new Date().toISOString();
     
-    if (!state.moduleId && this.moduleIdRetries < this.maxModuleIdRetries) {
-      this.moduleIdRetries++;
-      await requestModuleId();
-      await delay(1000);
-      
-      if (state.moduleId) {
-        this.moduleIdRetries = 0;
-        
-        if (!state.isReady) {
-          state.isReady = true;
-          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
-          
-          mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
-            deviceId: CONFIG.device.id,
-            status: 'ready',
-            event: 'startup_ready',
-            moduleId: state.moduleId,
-            isReady: true,
-            mode: 'guest_only',
-            sensorEnabled: false,
-            timestamp
-          }));
-          
-          mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
-            deviceId: CONFIG.device.id,
-            state: 'waiting_for_guest',
-            message: 'Press Start to begin',
-            timestamp
-          }));
-          
-          // ✅ PUBLISH INITIAL BIN STATUS
-          mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
-            deviceId: CONFIG.device.id,
-            binStatus: state.binStatus,
-            timestamp
-          }), { 
-            qos: 1, 
-            retain: true 
-          });
-          
-          log('📤 Initial bin status published', 'info');
-        }
-      }
-    }
-    
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
       connectWebSocket();
     }
@@ -560,23 +518,9 @@ const heartbeat = {
     const sessionStatus = state.autoCycleEnabled ? 'ACTIVE' : 'IDLE';
     const compactorStatus = state.compactorRunning ? '🔨' : '⚪';
     
-    console.log(`💓 ${state.moduleId || 'WAIT'} | ${sessionStatus} | ${compactorStatus}`);
+    console.log(`💓 ${state.moduleId} | ${sessionStatus} | ${compactorStatus}`);
   }
 };
-
-// ============================================
-// MODULE ID
-// ============================================
-async function requestModuleId() {
-  try {
-    await axios.post(`${CONFIG.local.baseUrl}/system/serial/getModuleId`, {}, {
-      timeout: 5000,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('❌ Module ID request failed:', error.message);
-  }
-}
 
 // ============================================
 // DIAGNOSTICS
@@ -604,10 +548,10 @@ function runDiagnostics() {
   
   console.log('\n🎯 System:');
   console.log(`   deviceId: ${CONFIG.device.id}`);
+  console.log(`   moduleId: ${state.moduleId} (HARDCODED)`);
   console.log(`   isReady: ${state.isReady}`);
   console.log(`   autoCycle: ${state.autoCycleEnabled}`);
   console.log(`   resetting: ${state.resetting}`);
-  console.log(`   moduleId: ${state.moduleId}`);
   console.log(`   cycleInProgress: ${state.cycleInProgress}`);
   console.log(`   guestSession: ${state.isGuestSession}`);
   
@@ -718,10 +662,6 @@ function determineMaterialType(aiData) {
 // ============================================
 async function executeCommand(action, params = {}) {
   const deviceType = 1;
-  
-  if (!state.moduleId && action !== 'getModuleId') {
-    throw new Error('Module ID not available');
-  }
   
   let apiUrl, apiPayload;
   
@@ -885,8 +825,6 @@ async function executeAutoCycle() {
 
     await executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home });
     await delay(CONFIG.timing.stepperReset);
-
-    // ✅ REMOVED: mqttClient.publish was here before — now it's at the top
 
     trackCycleTime(cycleStartTime);
     resetInactivityTimer();
@@ -1217,42 +1155,15 @@ function connectWebSocket() {
   
   state.ws.on('open', () => {
     log('✅ WebSocket connected', 'success');
-    
-    if (!state.moduleId) {
-      setTimeout(() => requestModuleId(), 1000);
-    }
   });
   
   state.ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
       
+      // ✅ Ignore moduleId responses from WS - we use hardcoded value
       if (message.function === '01') {
-        state.moduleId = message.moduleId;
-        heartbeat.moduleIdRetries = 0;
-        
-        if (!state.isReady) {
-          state.isReady = true;
-          log('✅ System ready - Guest mode (Sensor disabled)', 'success');
-          
-          mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
-            deviceId: CONFIG.device.id,
-            status: 'ready',
-            moduleId: state.moduleId,
-            isReady: true,
-            mode: 'guest_only',
-            sensorEnabled: false,
-            timestamp: new Date().toISOString()
-          }));
-          
-          mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
-            deviceId: CONFIG.device.id,
-            state: 'waiting_for_guest',
-            message: 'Press Start to begin',
-            timestamp: new Date().toISOString()
-          }));
-        }
-        
+        log(`ℹ️ WS moduleId received: ${message.moduleId} (ignored - using hardcoded ${HARDCODED_MODULE_ID})`, 'debug');
         return;
       }
       
@@ -1430,20 +1341,42 @@ mqttClient.on('connect', () => {
     timestamp: new Date().toISOString()
   }), { retain: true });
   
+  // ✅ System is immediately ready with hardcoded moduleId
+  state.isReady = true;
+  log(`✅ System ready - moduleId hardcoded to ${HARDCODED_MODULE_ID}`, 'success');
+  
   mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
     deviceId: CONFIG.device.id,
     status: 'ready',
     event: 'startup_ready',
+    moduleId: state.moduleId,
     isReady: true,
     mode: 'guest_only',
     sensorEnabled: false,
     timestamp: new Date().toISOString()
   }));
   
-  connectWebSocket();
+  mqttClient.publish(CONFIG.mqtt.topics.screenState, JSON.stringify({
+    deviceId: CONFIG.device.id,
+    state: 'waiting_for_guest',
+    message: 'Press Start to begin',
+    timestamp: new Date().toISOString()
+  }));
   
-  setTimeout(() => requestModuleId(), 2000);
-  setTimeout(() => heartbeat.start(), 5000);
+  // ✅ PUBLISH INITIAL BIN STATUS
+  mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
+    deviceId: CONFIG.device.id,
+    binStatus: state.binStatus,
+    timestamp: new Date().toISOString()
+  }), { 
+    qos: 1, 
+    retain: true 
+  });
+  
+  log('📤 Initial bin status published', 'info');
+  
+  connectWebSocket();
+  heartbeat.start();
 });
 
 mqttClient.on('message', async (topic, message) => {
@@ -1639,9 +1572,7 @@ mqttClient.on('message', async (topic, message) => {
         return;
       }
       
-      if (state.moduleId) {
-        await executeCommand(payload.action, payload.params);
-      }
+      await executeCommand(payload.action, payload.params);
     }
     
   } catch (error) {
@@ -1703,9 +1634,10 @@ process.on('unhandledRejection', (error) => {
 // STARTUP
 // ============================================
 console.log('='.repeat(50));
-console.log('🚀 RVM AGENT - GUEST MODE - BIN STATUS FIXED');
+console.log('🚀 RVM AGENT - GUEST MODE - MODULE ID HARDCODED');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
+console.log(`Module ID: ${HARDCODED_MODULE_ID} (HARDCODED)`);
 console.log(`Config: ${machineConfigPath}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');

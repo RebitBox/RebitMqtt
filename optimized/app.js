@@ -137,7 +137,7 @@ const HARDCODED_MODULE_ID = '09';
 // STATE MANAGEMENT
 // ============================================
 const state = {
-  moduleId: HARDCODED_MODULE_ID,  // ✅ Hardcoded to 9
+  moduleId: HARDCODED_MODULE_ID,  // ✅ Hardcoded to 09
   aiResult: null,
   weight: null,
   autoCycleEnabled: false,
@@ -367,8 +367,11 @@ async function scheduleNextPhotoWithPositioning() {
       log('🔍 Checking weight for item presence...', 'info');
       
       try {
-        // ⚡ getWeight already includes weightDelay internally - no extra delay needed
+        // getWeight HTTP call triggers measurement (includes 600ms internal delay)
+        // But the actual weight VALUE arrives via WebSocket (function '06')
+        // So we need an EXTRA delay to let the WS response arrive and populate state.weight
         await executeCommand('getWeight');
+        await delay(CONFIG.timing.weightDelay);  // ✅ RESTORED - wait for WS response
         
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
           log(`⚖️ No item detected (weight: ${state.weight ? state.weight.weight + 'g' : 'null'}) - waiting...`, 'debug');
@@ -436,7 +439,7 @@ async function scheduleNextPhotoWithPositioning() {
         }
       }
     }
-  }, 100);  // ⚡ was 500ms - reduced to 100ms
+  }, 500);  // ✅ RESTORED to 500ms - 100ms was too aggressive for serial polling
 }
 
 // ============================================

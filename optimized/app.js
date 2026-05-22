@@ -83,9 +83,9 @@ const CONFIG = {
   },
   
   detection: {
-    METAL_CAN: 0.65,
-    PLASTIC_BOTTLE: 0.65,
-    GLASS: 0.65,
+    METAL_CAN: 0.50,
+    PLASTIC_BOTTLE: 0.50,
+    GLASS: 0.50,
     retryDelay: 1500,
     maxRetries: 2,
     hasObjectSensor: false,

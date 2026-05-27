@@ -1290,11 +1290,35 @@ function connectWebSocket() {
           }
           
           if (state.aiResult.materialType === 'UNKNOWN') {
-            log('❌ Unknown material - rejecting', 'warning');
-            state.cycleInProgress = true;
-            executeRejectionCycle();  // ⚡ was setTimeout 500ms
-            return;
-          }
+  if (state.detectionRetries < CONFIG.detection.maxRetries) {
+    state.detectionRetries++;
+    log(`🔄 Unknown material - retry ${state.detectionRetries}/${CONFIG.detection.maxRetries} in ${CONFIG.detection.retryDelay}ms`, 'warning');
+    
+    state.awaitingDetection = true;
+    state.aiResult = null;
+    
+    setTimeout(async () => {
+      if (!state.autoCycleEnabled) return;
+      try {
+        log('📸 Retaking photo...', 'camera');
+        await executeCommand('takePhoto');
+      } catch (err) {
+        log(`Retry photo error: ${err.message}`, 'error');
+        state.awaitingDetection = false;
+        state.cycleInProgress = true;
+        executeRejectionCycle();
+      }
+    }, CONFIG.detection.retryDelay);  // 1500ms — already in your config
+    
+    return;
+  }
+  
+  // Exceeded maxRetries — now reject
+  log(`❌ Unknown material after ${state.detectionRetries} retries - rejecting`, 'warning');
+  state.cycleInProgress = true;
+  executeRejectionCycle();
+  return;
+}
           
           log('✅ Starting auto cycle...', 'success');
           state.cycleInProgress = true;

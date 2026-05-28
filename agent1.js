@@ -10,7 +10,7 @@ const { GlobalKeyboardListener } = require('node-global-key-listener');
 // ============================================
 const CONFIG = {
   device: {
-    id: 'RVM-3101'
+    id: 'RVM-3101-0002'
   },
   
   backend: {
@@ -30,17 +30,17 @@ const CONFIG = {
     password: '2o25@pR0Du$3rW8tl',
     caFile: 'C:\\Users\\YY\\RebitMqtt\\certs/app.rebit-japan.com.ca-bundle',
     topics: {
-      commands: 'rvm/RVM-3101/commands',
-      autoControl: 'rvm/RVM-3101/control/auto',
-      cycleComplete: 'rvm/RVM-3101/cycle/complete',
-      aiResult: 'rvm/RVM-3101/ai/result',
-      weightResult: 'rvm/RVM-3101/weight/result',
-      status: 'rvm/RVM-3101/status',
-      qrScan: 'rvm/RVM-3101/qr/scanned',
-      screenState: 'rvm/RVM-3101/screen/state',
-      qrInput: 'rvm/RVM-3101/qr/input',
-      guestStart: 'rvm/RVM-3101/guest/start',
-      binStatus: 'rvm/RVM-3101/bin/status'
+      commands: 'rvm/RVM-3101-0002/commands',
+      autoControl: 'rvm/RVM-3101-0002/control/auto',
+      cycleComplete: 'rvm/RVM-3101-0002/cycle/complete',
+      aiResult: 'rvm/RVM-3101-0002/ai/result',
+      weightResult: 'rvm/RVM-3101-0002/weight/result',
+      status: 'rvm/RVM-3101-0002/status',
+      qrScan: 'rvm/RVM-3101-0002/qr/scanned',
+      screenState: 'rvm/RVM-3101-0002/screen/state',
+      qrInput: 'rvm/RVM-3101-0002/qr/input',
+      guestStart: 'rvm/RVM-3101-0002/guest/start',
+      binStatus: 'rvm/RVM-3101-0002/bin/status'
     }
   },
   
@@ -1211,7 +1211,7 @@ async function executeRejectionCycle() {
 
     trackDetectionAttempt(false, state.detectionRetries);
 
-    mqttClient.publish('rvm/RVM-3101/item/rejected', JSON.stringify({
+    mqttClient.publish('rvm/RVM-3101-0002/item/rejected', JSON.stringify({
       deviceId: CONFIG.device.id,
       reason: 'LOW_CONFIDENCE',
       userId: state.currentUserId,

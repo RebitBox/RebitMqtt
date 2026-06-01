@@ -12,7 +12,11 @@ const axios  = require('axios');
 const fs     = require('fs');
 const path   = require('path');
 const WebSocket = require('ws');
-const { GlobalKeyboardListener } = require('node-global-key-listener');
+const HID = require('node-hid');
+
+// QR Scanner device (USBKey Module)
+const QR_VENDOR_ID  = 1317;
+const QR_PRODUCT_ID = 42156;
 
 // ============================================
 // LOAD MACHINE CONFIG
@@ -172,11 +176,11 @@ const state = {
   qrTimer:            null,
   processingQR:       false,
   processingQRTimeout: null,
-  globalKeyListener:  null,
   lastSuccessfulScan: null,
   lastKeyboardActivity: Date.now(),
   scannerHealthTimer: null,
   lastScannerRestart: Date.now(),
+  hidDevice: null,
 
   // Session
   sessionId:        null,
@@ -296,53 +300,36 @@ function logDetectionStats() {
 }
 
 // ============================================
-// QR SCANNER — FIXED
+// QR SCANNER — node-hid direct (no WinKeyServer.exe)
 // ============================================
 
-/**
- * Maps node-global-key-listener key name + shift state → printable character.
- * Returns null for non-printable keys.
- */
-function keyNameToChar(name, shiftDown) {
-  if (/^[A-Z]$/.test(name)) return shiftDown ? name : name.toLowerCase();
-
-  const DIGIT_MAP       = { '0':'0','1':'1','2':'2','3':'3','4':'4','5':'5','6':'6','7':'7','8':'8','9':'9' };
-  const SHIFT_DIGIT_MAP = { '0':')','1':'!','2':'@','3':'#','4':'$','5':'%','6':'^','7':'&','8':'*','9':'(' };
-  if (DIGIT_MAP[name]) return shiftDown ? SHIFT_DIGIT_MAP[name] : DIGIT_MAP[name];
-
-  const SYMBOL_MAP = {
-    'SPACE':           [' ',' '],
-    'MINUS':           ['-','_'],
-    'EQUALS':          ['=','+'],
-    'LEFT BRACKET':    ['[','{'],
-    'RIGHT BRACKET':   [']','}'],
-    'BACK SLASH':      ['\\','|'],
-    'SEMICOLON':       [';',':'],
-    'QUOTE':           ["'",'"'],
-    'COMMA':           [',','<'],
-    'PERIOD':          ['.','>'],
-    'FORWARD SLASH':   ['/','?'],
-    'BACK QUOTE':      ['`','~'],
-    'NUMPAD 0':        ['0','0'],
-    'NUMPAD 1':        ['1','1'],
-    'NUMPAD 2':        ['2','2'],
-    'NUMPAD 3':        ['3','3'],
-    'NUMPAD 4':        ['4','4'],
-    'NUMPAD 5':        ['5','5'],
-    'NUMPAD 6':        ['6','6'],
-    'NUMPAD 7':        ['7','7'],
-    'NUMPAD 8':        ['8','8'],
-    'NUMPAD 9':        ['9','9'],
-    'NUMPAD PERIOD':   ['.', '.'],
-    'NUMPAD ADD':      ['+', '+'],
-    'NUMPAD MINUS':    ['-', '-'],
-    'NUMPAD MULTIPLY': ['*', '*'],
-    'NUMPAD DIVIDE':   ['/', '/'],
-  };
-  if (SYMBOL_MAP[name]) return SYMBOL_MAP[name][shiftDown ? 1 : 0];
-
-  return null;
-}
+// USB HID scan-code → character maps
+const HID_KEY_MAP = {
+  0x04:'a',0x05:'b',0x06:'c',0x07:'d',0x08:'e',0x09:'f',
+  0x0A:'g',0x0B:'h',0x0C:'i',0x0D:'j',0x0E:'k',0x0F:'l',
+  0x10:'m',0x11:'n',0x12:'o',0x13:'p',0x14:'q',0x15:'r',
+  0x16:'s',0x17:'t',0x18:'u',0x19:'v',0x1A:'w',0x1B:'x',
+  0x1C:'y',0x1D:'z',
+  0x1E:'1',0x1F:'2',0x20:'3',0x21:'4',0x22:'5',
+  0x23:'6',0x24:'7',0x25:'8',0x26:'9',0x27:'0',
+  0x28:'\n',0x2C:' ',0x2D:'-',0x2E:'=',0x2F:'[',
+  0x30:']',0x31:'\\',0x33:';',0x34:"'",0x35:'`',
+  0x36:',',0x37:'.',0x38:'/',
+  0x59:'1',0x5A:'2',0x5B:'3',0x5C:'4',0x5D:'5',
+  0x5E:'6',0x5F:'7',0x60:'8',0x61:'9',0x62:'0',
+  0x63:'.',0x56:'-',0x57:'+',0x55:'*',0x54:'/'
+};
+const HID_SHIFT_MAP = {
+  0x04:'A',0x05:'B',0x06:'C',0x07:'D',0x08:'E',0x09:'F',
+  0x0A:'G',0x0B:'H',0x0C:'I',0x0D:'J',0x0E:'K',0x0F:'L',
+  0x10:'M',0x11:'N',0x12:'O',0x13:'P',0x14:'Q',0x15:'R',
+  0x16:'S',0x17:'T',0x18:'U',0x19:'V',0x1A:'W',0x1B:'X',
+  0x1C:'Y',0x1D:'Z',
+  0x1E:'!',0x1F:'@',0x20:'#',0x21:'$',0x22:'%',
+  0x23:'^',0x24:'&',0x25:'*',0x26:'(',0x27:')',
+  0x2D:'_',0x2E:'+',0x2F:'{',0x30:'}',0x31:'|',
+  0x33:':',0x34:'"',0x35:'~',0x36:'<',0x37:'>',0x38:'?'
+};
 
 function canAcceptQRScan() {
   return state.isReady &&
@@ -366,11 +353,11 @@ function clearQRProcessing() {
 }
 
 function forceRestartScanner() {
-  log('Restarting QR scanner...', 'warning');
+  log('Restarting HID QR scanner...', 'warning');
   clearQRProcessing();
-  if (state.globalKeyListener) {
-    try { state.globalKeyListener.kill(); } catch (e) { /* ignore */ }
-    state.globalKeyListener = null;
+  if (state.hidDevice) {
+    try { state.hidDevice.close(); } catch (_) {}
+    state.hidDevice = null;
   }
   setTimeout(() => setupQRScanner(), 1000);
 }
@@ -378,14 +365,9 @@ function forceRestartScanner() {
 function startScannerHealthMonitor() {
   if (state.scannerHealthTimer) clearInterval(state.scannerHealthTimer);
   state.scannerHealthTimer = setInterval(() => {
-    const timeSinceActivity = Date.now() - state.lastKeyboardActivity;
-    const timeSinceRestart  = Date.now() - state.lastScannerRestart;
-    if (!state.globalKeyListener && canAcceptQRScan()) {
-      log('Auto-healing QR scanner...', 'warning');
-      forceRestartScanner();
-    } else if (timeSinceActivity > 180000 && timeSinceRestart > 30000 && canAcceptQRScan()) {
-      log('Scanner unresponsive — auto-healing...', 'warning');
-      forceRestartScanner();
+    if (!state.hidDevice && canAcceptQRScan()) {
+      log('Auto-healing HID scanner...', 'warning');
+      setupQRScanner();
     }
   }, CONFIG.qr.healthCheckInterval);
 }
@@ -491,50 +473,50 @@ async function processQRCode(qrData) {
   }
 }
 
-function createKeyboardListener() {
-  console.log('\n' + '='.repeat(50));
-  console.log('QR SCANNER — CREATING LISTENER');
-  console.log('='.repeat(50) + '\n');
+function setupQRScanner() {
+  if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
 
-  const CONSOLE_PATTERNS = [
-    /^C:\\/i, /^[A-Z]:\\/i,
-    /operable program/i, /batch file/i,
-    /Users\\/i, /\\rebit-mqtt/i,
-    /node/i, /RVM AGENT/i
-  ];
-  const isConsoleOutput = (text) => CONSOLE_PATTERNS.some(p => p.test(text));
+  if (state.hidDevice) {
+    try { state.hidDevice.close(); } catch (_) {}
+    state.hidDevice = null;
+  }
 
-  // Per-listener shift state — reset when listener is killed
-  let shiftDown = false;
+  log('Opening HID QR scanner...', 'qr');
 
+  let device;
   try {
-    const gkl = new GlobalKeyboardListener();
+    device = new HID.HID(QR_VENDOR_ID, QR_PRODUCT_ID);
+  } catch (err) {
+    log(`HID open failed: ${err.message}`, 'error');
+    log('Retrying in 3s...', 'warning');
+    setTimeout(() => setupQRScanner(), 3000);
+    return;
+  }
 
-    gkl.addListener((e) => {
-      state.lastKeyboardActivity = Date.now();
+  state.hidDevice = device;
+  state.lastScannerRestart   = Date.now();
+  state.lastKeyboardActivity = Date.now();
 
-      // Track shift key on both DOWN and UP
-      if (e.name === 'LEFT SHIFT' || e.name === 'RIGHT SHIFT') {
-        shiftDown = (e.state === 'DOWN');
-        return;
-      }
+  device.on('data', (data) => {
+    state.lastKeyboardActivity = Date.now();
+    if (!canAcceptQRScan()) return;
 
-      if (e.state !== 'DOWN') return;
-      if (!canAcceptQRScan()) return;
+    const modifier  = data[0];
+    const shiftDown = (modifier & 0x02) || (modifier & 0x20);
 
-      const currentTime = Date.now();
+    for (let i = 2; i < 8; i++) {
+      const keyCode = data[i];
+      if (!keyCode) continue;
 
-      // ENTER / RETURN → submit buffer
-      if (e.name === 'RETURN' || e.name === 'ENTER') {
+      if (keyCode === 0x28) {
         if (
           state.qrBuffer.length >= CONFIG.qr.minLength &&
-          state.qrBuffer.length <= CONFIG.qr.maxLength &&
-          !isConsoleOutput(state.qrBuffer)
+          state.qrBuffer.length <= CONFIG.qr.maxLength
         ) {
           const qrCode = state.qrBuffer;
           state.qrBuffer = '';
           if (state.qrTimer) { clearTimeout(state.qrTimer); state.qrTimer = null; }
-          log(`QR detected (ENTER): ${qrCode}`, 'success');
+          log(`QR detected: ${qrCode}`, 'success');
           processQRCode(qrCode).catch(err => {
             log(`QR async error: ${err.message}`, 'error');
             clearQRProcessing();
@@ -545,40 +527,31 @@ function createKeyboardListener() {
         return;
       }
 
-      // BACKSPACE → trim (some scanner models emit it)
-      if (e.name === 'BACKSPACE') {
-        state.qrBuffer = state.qrBuffer.slice(0, -1);
-        return;
-      }
+      const char = shiftDown
+        ? (HID_SHIFT_MAP[keyCode] || HID_KEY_MAP[keyCode] || null)
+        : (HID_KEY_MAP[keyCode] || null);
+      if (!char || char === '\n') continue;
 
-      // Map key name → printable character (FIX: was appending raw e.name)
-      const char = keyNameToChar(e.name, shiftDown);
-      if (char === null) return;
-
-      // Reset buffer on gap between characters
+      const currentTime = Date.now();
       if ((currentTime - state.lastCharTime) > CONFIG.qr.scanTimeout && state.qrBuffer.length > 0) {
         state.qrBuffer = '';
       }
-
-      // Overflow guard
       if (state.qrBuffer.length >= CONFIG.qr.maxLength) {
         state.qrBuffer = '';
         if (state.qrTimer) { clearTimeout(state.qrTimer); state.qrTimer = null; }
-        return;
+        continue;
       }
 
       state.qrBuffer    += char;
       state.lastCharTime = currentTime;
       debugLog(`Buffer: "${state.qrBuffer}"`);
 
-      // Auto-submit (fallback for scanners that omit ENTER)
       if (state.qrTimer) clearTimeout(state.qrTimer);
       state.qrTimer = setTimeout(() => {
         state.qrTimer = null;
         if (
           state.qrBuffer.length >= CONFIG.qr.minLength &&
-          state.qrBuffer.length <= CONFIG.qr.maxLength &&
-          !isConsoleOutput(state.qrBuffer)
+          state.qrBuffer.length <= CONFIG.qr.maxLength
         ) {
           const qrCode = state.qrBuffer;
           state.qrBuffer = '';
@@ -591,48 +564,18 @@ function createKeyboardListener() {
           state.qrBuffer = '';
         }
       }, CONFIG.qr.scanTimeout);
-    });
+    }
+  });
 
-    state.globalKeyListener   = gkl;
-    state.lastScannerRestart   = Date.now();
-    state.lastKeyboardActivity = Date.now();
-    log('Keyboard listener created', 'success');
+  device.on('error', (err) => {
+    log(`HID error: ${err.message}`, 'error');
+    state.hidDevice = null;
+    setTimeout(() => { if (canAcceptQRScan()) setupQRScanner(); }, 3000);
+  });
 
-  } catch (error) {
-    log(`Failed to create keyboard listener: ${error.message}`, 'error');
-    state.globalKeyListener = null;
-  }
+  log(`QR scanner ready (HID ${QR_VENDOR_ID}:${QR_PRODUCT_ID})`, 'success');
 }
 
-function setupQRScanner() {
-  if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
-
-  if (state.globalKeyListener) {
-    try {
-      state.globalKeyListener.kill();
-      state.globalKeyListener = null;
-    } catch (e) { state.globalKeyListener = null; }
-    setTimeout(() => createKeyboardListener(), 800);
-    return;
-  }
-  createKeyboardListener();
-}
-
-function checkScannerHealth() {
-  const timeSinceActivity = Date.now() - state.lastKeyboardActivity;
-  const timeSinceRestart  = Date.now() - state.lastScannerRestart;
-
-  log(`Scanner | ready:${state.isReady} cycle:${state.autoCycleEnabled} proc:${state.processingQR} active:${state.globalKeyListener ? 'Y' : 'N'} idle:${Math.round(timeSinceActivity/1000)}s`, 'qr');
-
-  if (state.processingQR && !state.processingQRTimeout) {
-    log('processingQR stuck — clearing', 'warning');
-    clearQRProcessing();
-  }
-  if (!state.globalKeyListener && state.isReady && !state.autoCycleEnabled) {
-    log('Listener missing — recreating', 'warning');
-    setupQRScanner();
-  }
-}
 
 // ============================================
 // COMPACTOR
@@ -790,7 +733,7 @@ const heartbeat = {
       autoCycleEnabled:      state.autoCycleEnabled,
       canAcceptQRScan:       canAcceptQRScan(),
       processingQR:          state.processingQR,
-      keyboardListenerActive: state.globalKeyListener !== null,
+      hidDeviceActive: state.hidDevice !== null,
       compactorRunning:      state.compactorRunning,
       lastCycleTime:         state.lastCycleTime,
       detectionStats:        state.detectionStats,
@@ -1223,8 +1166,9 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
-    if (CONFIG.qr.restartAfterSession) {
-      setTimeout(() => forceRestartScanner(), 1500);
+    // HID scanner reconnects automatically after session
+    if (CONFIG.qr.restartAfterSession && !state.hidDevice) {
+      setTimeout(() => setupQRScanner(), 1500);
     }
 
     console.log('='.repeat(50));
@@ -1584,7 +1528,7 @@ mqttClient.on('message', async (topic, message) => {
             moduleId: state.moduleId,
             detectionStats: state.detectionStats,
             canAcceptQRScan: canAcceptQRScan(),
-            keyboardListenerActive: state.globalKeyListener !== null,
+            hidDeviceActive: state.hidDevice !== null,
             timestamp: new Date().toISOString()
           })); break;
 
@@ -1662,8 +1606,9 @@ function gracefulShutdown() {
   stopCompactor();
   if (state.autoPhotoTimer) clearTimeout(state.autoPhotoTimer);
   clearSessionTimers();
-  if (state.globalKeyListener) {
-    try { state.globalKeyListener.kill(); } catch (_) { /* ignore */ }
+  if (state.hidDevice) {
+    try { state.hidDevice.close(); } catch (_) { /* ignore */ }
+    state.hidDevice = null;
   }
   mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
     deviceId: CONFIG.device.id, status: 'offline', timestamp: new Date().toISOString()
@@ -1686,7 +1631,7 @@ console.log('='.repeat(60));
 console.log(`Device:     ${CONFIG.device.id}`);
 console.log(`Module ID:  ${HARDCODED_MODULE_ID} (HARDCODED)`);
 console.log(`Config:     ${machineConfigPath}`);
-console.log('QR fixes:   ✅ char mapping  ✅ shift key  ✅ race guard');
+console.log('QR scanner: ✅ node-hid direct (no WinKeyServer.exe)');
 console.log('Timings:    ⚡ beltToStepper 1800  stepperReset 2200');
 console.log('            ⚡ itemDropDelay  300  photoDelay   300');
 console.log('            ⚡ stepper-home fire-and-forget');

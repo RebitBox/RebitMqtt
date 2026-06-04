@@ -83,7 +83,7 @@ const CONFIG = {
     scanTimeout:        200,
     processingTimeout:  25000,
     debug:              false,
-    healthCheckInterval: 15000
+    healthCheckInterval: 3000   // ⚡ check every 3s — detect USB disconnect faster
   },
 
   motors: {
@@ -301,16 +301,33 @@ function forceRestartScanner() {
 function startScannerHealthMonitor() {
   if (state.scannerHealthTimer) clearInterval(state.scannerHealthTimer);
   state.scannerHealthTimer = setInterval(() => {
-    // Auto-heal if listener died
-    if (!state.globalKeyListener && canAcceptQRScan()) {
-      log('💊 Auto-healing QR scanner...', 'warning');
-      forceRestartScanner();
-    }
+
     // Clear stuck processing state
     if (state.processingQR && !state.processingQRTimeout) {
       log('⚠️ processingQR stuck — clearing', 'warning');
       clearQRProcessing();
     }
+
+    // Only check scanner when system is idle (not in session)
+    if (!canAcceptQRScan()) return;
+
+    // Check if WinKeyServer process is still alive
+    const listenerAlive = state.globalKeyListener !== null;
+    const recentActivity = (Date.now() - state.lastKeyboardActivity) < 60000;
+
+    if (!listenerAlive) {
+      log('💊 Listener gone — restarting QR scanner...', 'warning');
+      forceRestartScanner();
+      return;
+    }
+
+    // If listener exists but WinKeyServer.exe may have crashed silently
+    // (no activity for 60s while idle — motor noise may have killed USB)
+    if (!recentActivity) {
+      log('💊 Scanner may be dead (no activity 60s) — restarting...', 'warning');
+      forceRestartScanner();
+    }
+
   }, CONFIG.qr.healthCheckInterval);
 }
 
@@ -820,6 +837,17 @@ async function executeCommand(action, params = {}) {
   }
 }
 
+// ✅ Call this after motor cycles complete to recover USB scanner
+function scheduleQRRecovery() {
+  // Wait for USB to settle after motor electrical noise, then restart listener
+  setTimeout(() => {
+    if (!state.autoCycleEnabled && state.isReady) {
+      log('🔄 Post-motor QR recovery...', 'qr');
+      forceRestartScanner();
+    }
+  }, 2000);
+}
+
 // ============================================
 // REJECTION CYCLE  (unchanged)
 // ============================================
@@ -901,6 +929,11 @@ async function executeAutoCycle() {
   state.aiResult = null; state.weight = null;
   state.cycleInProgress = false; state.detectionRetries = 0;
   state.awaitingDetection = false; state.itemAlreadyPositioned = false;
+
+  // ✅ After motor cycle, update keyboard activity time
+  // so health monitor doesn't think scanner is dead
+  state.lastKeyboardActivity = Date.now();
+
   if (state.autoCycleEnabled) await scheduleNextPhotoWithPositioning();
 }
 
@@ -1105,6 +1138,13 @@ async function resetSystemForNextUser(forceStop = false) {
 
     log('✅ System ready for next user', 'success');
     log(`⏱️ Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
+    // Extra recovery in case USB was disrupted by motor noise during session
+    setTimeout(() => {
+      if (state.isReady && !state.autoCycleEnabled && !state.globalKeyListener) {
+        log('💊 Post-reset QR recovery check...', 'qr');
+        setupQRScanner();
+      }
+    }, 3000);
   }
 }
 

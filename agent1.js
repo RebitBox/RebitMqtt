@@ -1080,6 +1080,15 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
+    // ✅ Restart QR scanner after session — listener may have died
+    log('🔄 Restarting QR scanner for next user...', 'qr');
+    clearQRProcessing();
+    if (state.globalKeyListener) {
+      try { state.globalKeyListener.kill(); } catch (_) {}
+      state.globalKeyListener = null;
+    }
+    setTimeout(() => setupQRScanner(), 1000);
+
     console.log('='.repeat(50));
     console.log('✅ READY FOR NEXT USER');
     console.log('='.repeat(50) + '\n');

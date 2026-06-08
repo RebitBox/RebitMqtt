@@ -83,7 +83,7 @@ const CONFIG = {
     scanTimeout:        200,
     processingTimeout:  25000,
     debug:              false,
-    healthCheckInterval: 3000   // ⚡ check every 3s — detect USB disconnect faster
+    healthCheckInterval: 5000
   },
 
   motors: {
@@ -311,20 +311,9 @@ function startScannerHealthMonitor() {
     // Only check scanner when system is idle (not in session)
     if (!canAcceptQRScan()) return;
 
-    // Check if WinKeyServer process is still alive
-    const listenerAlive = state.globalKeyListener !== null;
-    const recentActivity = (Date.now() - state.lastKeyboardActivity) < 60000;
-
-    if (!listenerAlive) {
+    // Restart only if listener object is gone (process crashed)
+    if (!state.globalKeyListener) {
       log('💊 Listener gone — restarting QR scanner...', 'warning');
-      forceRestartScanner();
-      return;
-    }
-
-    // If listener exists but WinKeyServer.exe may have crashed silently
-    // (no activity for 60s while idle — motor noise may have killed USB)
-    if (!recentActivity) {
-      log('💊 Scanner may be dead (no activity 60s) — restarting...', 'warning');
       forceRestartScanner();
     }
 
@@ -415,6 +404,42 @@ async function processQRCode(qrData) {
     if (!sessionStarted) clearQRProcessing();
     log('QR processing complete', 'qr');
   }
+}
+
+// ✅ Force Windows USB device reset
+// Fixes QR scanner getting stuck after motor electrical noise
+// Only works if run as Administrator
+async function resetUSBDevice() {
+  return new Promise((resolve) => {
+    const { exec } = require('child_process');
+
+    // Use separate string building to avoid regex-in-template-literal parse issues
+    const psScript = [
+      '$dev = Get-PnpDevice | Where-Object {',
+      '  $_.InstanceId -like "*VID_0525*" -and',
+      '  $_.InstanceId -like "*PID_A4AC*"',
+      '} | Select-Object -First 1;',
+      'if ($dev) {',
+      '  Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
+      '  Start-Sleep -Milliseconds 800;',
+      '  Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
+      '  Write-Host "USB reset done";',
+      '} else {',
+      '  Write-Host "USB device not found - skipping reset";',
+      '}'
+    ].join(' ');
+
+    const cmd = 'powershell -Command "' + psScript + '"';
+
+    exec(cmd, { timeout: 10000 }, (error, stdout, stderr) => {
+      if (error) {
+        log('USB reset error: ' + error.message, 'warning');
+      } else {
+        log('USB reset: ' + stdout.trim(), 'qr');
+      }
+      resolve(); // always continue even if reset fails
+    });
+  });
 }
 
 function setupQRScanner() {
@@ -522,6 +547,29 @@ function createKeyboardListener() {
     state.lastScannerRestart   = Date.now();
     state.lastKeyboardActivity = Date.now();
     log('✅ QR keyboard listener created — works with UI open', 'success');
+    log('📱 Ready — scan QR code now', 'qr');
+
+    // ✅ Detect when WinKeyServer.exe crashes silently (e.g. after motor USB noise)
+    // The underlying process emits 'close' when it dies
+    try {
+      const proc = gkl._keyServer && gkl._keyServer.proc;
+      if (proc) {
+        proc.on('close', (code) => {
+          log(`⚠️ WinKeyServer process exited (code: ${code}) — will restart`, 'warning');
+          state.globalKeyListener = null;  // mark as dead so health monitor restarts it
+          if (canAcceptQRScan()) {
+            setTimeout(() => forceRestartScanner(), 1000);
+          }
+        });
+        proc.on('error', (err) => {
+          log(`⚠️ WinKeyServer process error: ${err.message} — will restart`, 'warning');
+          state.globalKeyListener = null;
+          if (canAcceptQRScan()) {
+            setTimeout(() => forceRestartScanner(), 1000);
+          }
+        });
+      }
+    } catch (_) { /* ignore — process monitoring is best-effort */ }
 
   } catch (error) {
     log(`❌ Failed to create keyboard listener: ${error.message}`, 'error');
@@ -1113,14 +1161,21 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
-    // ✅ Restart QR scanner after session — listener may have died
-    log('🔄 Restarting QR scanner for next user...', 'qr');
+    // ✅ After motors run, USB device may be stuck — force Windows USB reset
+    log('🔄 Resetting USB QR scanner device...', 'qr');
     clearQRProcessing();
     if (state.globalKeyListener) {
       try { state.globalKeyListener.kill(); } catch (_) {}
       state.globalKeyListener = null;
     }
-    setTimeout(() => setupQRScanner(), 1000);
+    // Step 1: Force Windows to disable/enable the USB device (fixes motor noise damage)
+    resetUSBDevice().then(() => {
+      // Step 2: Wait 2s for USB to fully re-enumerate
+      setTimeout(() => {
+        log('🔄 USB reset done — starting fresh QR listener...', 'qr');
+        setupQRScanner();
+      }, 2000);
+    });
 
     console.log('='.repeat(50));
     console.log('✅ READY FOR NEXT USER');

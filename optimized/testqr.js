@@ -1631,7 +1631,7 @@ console.log('🚀 RVM AGENT — GUEST + MEMBER (QR)');
 console.log('='.repeat(55));
 console.log(`Device:    ${CONFIG.device.id}`);
 console.log(`Module ID: ${HARDCODED_MODULE_ID} (HARDCODED)`);
-console.log(`Config:    ${machineConfigPath}`);
+// console.log(`Config:    ${machineConfigPath}`);
 console.log('QR:        ✅ GlobalKeyboardListener (works with UI open)');
 console.log('Guest:     ✅ press Start button as before');
 console.log('Member:    ✅ scan QR code to start session');

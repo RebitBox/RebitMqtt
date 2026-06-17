@@ -10,16 +10,16 @@ const WebSocket = require('ws');
 // ============================================
 // LOAD MACHINE CONFIG
 // ============================================
-const machineConfigPath = path.join('C:\\Users\\YY', 'machine-config.json');
+// const machineConfigPath = path.join('C:\\Users\\YY', 'machine-config.json');
 
-if (!fs.existsSync(machineConfigPath)) {
-  console.error(`❌ Config file not found: ${machineConfigPath}`);
-  console.error('Please create machine-config.json with: { "deviceId": "RVM-XXXX" }');
-  process.exit(1);
-}
+// if (!fs.existsSync(machineConfigPath)) {
+//   console.error(`❌ Config file not found: ${machineConfigPath}`);
+//   console.error('Please create machine-config.json with: { "deviceId": "RVM-XXXX" }');
+//   process.exit(1);
+// }
 
-const machineConfig = JSON.parse(fs.readFileSync(machineConfigPath, 'utf8'));
-const DEVICE_ID = machineConfig.deviceId;
+// const machineConfig = JSON.parse(fs.readFileSync(machineConfigPath, 'utf8'));
+const DEVICE_ID = 'RVM-3101-0002'; // HARDCODED FOR TESTING
 
 if (!DEVICE_ID) {
   console.error('❌ deviceId not found in machine-config.json');
@@ -1638,7 +1638,7 @@ console.log('🚀 RVM AGENT - GUEST MODE - MODULE ID HARDCODED');
 console.log('='.repeat(50));
 console.log(`Device: ${CONFIG.device.id}`);
 console.log(`Module ID: ${HARDCODED_MODULE_ID} (HARDCODED)`);
-console.log(`Config: ${machineConfigPath}`);
+// console.log(`Config: ${machineConfigPath}`);
 console.log('Mode: Guest users only');
 console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');

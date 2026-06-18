@@ -173,6 +173,7 @@ const state = {
   lastKeyboardActivity: Date.now(),
   scannerHealthTimer:   null,
   lastScannerRestart:   Date.now(),
+  scannerSettingUp:     false,   // ✅ guard: only one setup at a time (prevents double-scan)
 
   // Session (extended for member + guest)
   sessionId:        null,
@@ -416,16 +417,16 @@ async function resetUSBDevice() {
     // Use separate string building to avoid regex-in-template-literal parse issues
     const psScript = [
       '$dev = Get-PnpDevice | Where-Object {',
-      '  $_.InstanceId -like "*VID_0525*" -and',
-      '  $_.InstanceId -like "*PID_A4AC*"',
+      "  $_.InstanceId -like '*VID_0525*' -and",
+      "  $_.InstanceId -like '*PID_A4AC*'",
       '} | Select-Object -First 1;',
       'if ($dev) {',
       '  Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
       '  Start-Sleep -Milliseconds 800;',
       '  Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
-      '  Write-Host "USB reset done";',
+      "  Write-Host 'USB reset done';",
       '} else {',
-      '  Write-Host "USB device not found - skipping reset";',
+      "  Write-Host 'USB device not found - skipping reset';",
       '}'
     ].join(' ');
 
@@ -445,15 +446,32 @@ async function resetUSBDevice() {
 function setupQRScanner() {
   if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
 
-  // Kill existing listener if any
+  // ✅ Guard: if a setup is already running, don't start another.
+  // Without this, the reset path + health monitor could create 2-3 listeners
+  // at once, causing each scanned digit to fire multiple times (double-scan).
+  if (state.scannerSettingUp) {
+    log('⏳ Scanner setup already in progress — skipping duplicate', 'warning');
+    return;
+  }
+  state.scannerSettingUp = true;
+
+  // Kill our listener object if it exists
   if (state.globalKeyListener) {
     try { state.globalKeyListener.kill(); } catch (e) { /* ignore */ }
     state.globalKeyListener = null;
-    setTimeout(() => createKeyboardListener(), 800);
-    return;
   }
 
-  createKeyboardListener();
+  // ✅ Force-kill ANY stray WinKeyServer.exe still hooked to the keyboard.
+  // This is the real fix for double/triple scans — old instances that didn't
+  // die cleanly stay hooked and each one fires the same keystroke again.
+  const { exec } = require('child_process');
+  exec('taskkill /F /IM WinKeyServer.exe /T', () => {
+    // Wait for processes to fully exit before creating a fresh single listener
+    setTimeout(() => {
+      createKeyboardListener();
+      state.scannerSettingUp = false;   // release guard
+    }, 800);
+  });
 }
 
 function createKeyboardListener() {
@@ -1193,13 +1211,10 @@ async function resetSystemForNextUser(forceStop = false) {
 
     log('✅ System ready for next user', 'success');
     log(`⏱️ Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
-    // Extra recovery in case USB was disrupted by motor noise during session
-    setTimeout(() => {
-      if (state.isReady && !state.autoCycleEnabled && !state.globalKeyListener) {
-        log('💊 Post-reset QR recovery check...', 'qr');
-        setupQRScanner();
-      }
-    }, 3000);
+    // ✅ Removed the extra 3s "recovery" spawn — it created a SECOND listener
+    // on top of the one started by resetUSBDevice().then(...), which is what
+    // caused the double-scan. setupQRScanner is now idempotent and the health
+    // monitor restarts the listener if it ever dies, so this is no longer needed.
   }
 }
 

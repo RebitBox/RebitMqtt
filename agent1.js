@@ -417,16 +417,16 @@ async function resetUSBDevice() {
     // Use separate string building to avoid regex-in-template-literal parse issues
     const psScript = [
       '$dev = Get-PnpDevice | Where-Object {',
-      "  $_.InstanceId -like '*VID_0525*' -and",
-      "  $_.InstanceId -like '*PID_A4AC*'",
+      '  $_.InstanceId -like "*VID_0525*" -and',
+      '  $_.InstanceId -like "*PID_A4AC*"',
       '} | Select-Object -First 1;',
       'if ($dev) {',
       '  Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
       '  Start-Sleep -Milliseconds 800;',
       '  Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue;',
-      "  Write-Host 'USB reset done';",
+      '  Write-Host "USB reset done";',
       '} else {',
-      "  Write-Host 'USB device not found - skipping reset';",
+      '  Write-Host "USB device not found - skipping reset";',
       '}'
     ].join(' ');
 
@@ -446,32 +446,15 @@ async function resetUSBDevice() {
 function setupQRScanner() {
   if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
 
-  // ✅ Guard: if a setup is already running, don't start another.
-  // Without this, the reset path + health monitor could create 2-3 listeners
-  // at once, causing each scanned digit to fire multiple times (double-scan).
-  if (state.scannerSettingUp) {
-    log('⏳ Scanner setup already in progress — skipping duplicate', 'warning');
-    return;
-  }
-  state.scannerSettingUp = true;
-
-  // Kill our listener object if it exists
+  // Kill existing listener if any
   if (state.globalKeyListener) {
     try { state.globalKeyListener.kill(); } catch (e) { /* ignore */ }
     state.globalKeyListener = null;
+    setTimeout(() => createKeyboardListener(), 800);
+    return;
   }
 
-  // ✅ Force-kill ANY stray WinKeyServer.exe still hooked to the keyboard.
-  // This is the real fix for double/triple scans — old instances that didn't
-  // die cleanly stay hooked and each one fires the same keystroke again.
-  const { exec } = require('child_process');
-  exec('taskkill /F /IM WinKeyServer.exe /T', () => {
-    // Wait for processes to fully exit before creating a fresh single listener
-    setTimeout(() => {
-      createKeyboardListener();
-      state.scannerSettingUp = false;   // release guard
-    }, 800);
-  });
+  createKeyboardListener();
 }
 
 function createKeyboardListener() {
@@ -1179,21 +1162,21 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
-    // ✅ After motors run, USB device may be stuck — force Windows USB reset
-    log('🔄 Resetting USB QR scanner device...', 'qr');
+    // ✅ Re-arm the QR scanner WITHOUT the heavy Windows PnP USB reset.
+    // The old code ran resetUSBDevice() (Disable/Enable-PnpDevice) on EVERY
+    // session reset. That PowerShell child process stalls the Node event loop
+    // for a second or two, and if the next QR scan starts a session during
+    // that stall, the first belt move's `await delay(1800)` fires late and the
+    // belt overshoots/undershoots — exactly the "first item after QR" symptom.
+    //
+    // setupQRScanner() already does a clean taskkill + fresh single listener,
+    // which is enough to recover the scanner after normal motor activity.
+    // The expensive PnP reset is now reserved for the case where the listener
+    // genuinely fails to come back (checked below), so it never collides with
+    // a fresh session's belt timing.
+    log('🔄 Re-arming QR scanner (light)...', 'qr');
     clearQRProcessing();
-    if (state.globalKeyListener) {
-      try { state.globalKeyListener.kill(); } catch (_) {}
-      state.globalKeyListener = null;
-    }
-    // Step 1: Force Windows to disable/enable the USB device (fixes motor noise damage)
-    resetUSBDevice().then(() => {
-      // Step 2: Wait 2s for USB to fully re-enumerate
-      setTimeout(() => {
-        log('🔄 USB reset done — starting fresh QR listener...', 'qr');
-        setupQRScanner();
-      }, 2000);
-    });
+    setupQRScanner();
 
     console.log('='.repeat(50));
     console.log('✅ READY FOR NEXT USER');
@@ -1211,10 +1194,19 @@ async function resetSystemForNextUser(forceStop = false) {
 
     log('✅ System ready for next user', 'success');
     log(`⏱️ Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
-    // ✅ Removed the extra 3s "recovery" spawn — it created a SECOND listener
-    // on top of the one started by resetUSBDevice().then(...), which is what
-    // caused the double-scan. setupQRScanner is now idempotent and the health
-    // monitor restarts the listener if it ever dies, so this is no longer needed.
+    // ✅ Fallback recovery: only if the light re-arm above did NOT bring the
+    // listener back. This is the ONLY place the heavy PnP USB reset can run,
+    // and it runs while idle (no session active), so it can't stall a belt move.
+    setTimeout(() => {
+      if (state.isReady && !state.autoCycleEnabled && !state.globalKeyListener && !state.scannerSettingUp) {
+        log('💊 Listener did not recover — running full USB reset...', 'qr');
+        resetUSBDevice().then(() => {
+          setTimeout(() => {
+            if (!state.autoCycleEnabled) setupQRScanner();
+          }, 2000);
+        });
+      }
+    }, 4000);
   }
 }
 

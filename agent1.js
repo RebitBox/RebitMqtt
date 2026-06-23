@@ -4,27 +4,43 @@
 // Added: startMemberSession() for QR-validated users
 // Added: validateQRWithBackend()
 // Added: qrInput MQTT topic subscription
-// Everything else IDENTICAL to guest-only production code
+//
+// ============================================================
+// SCANNER LIFECYCLE FIX (scanner dies after 4-5 scans)
+// ============================================================
+// Root cause: every session reset spawned 2-3 WinKeyServer.exe processes
+// (setupQRScanner + proc.close handler + health monitor + USB-reset callback
+// all racing), and gkl.kill() did not wait for the old process to die. Each
+// orphaned WinKeyServer holds its own SetWindowsHookEx low-level keyboard hook;
+// after a few scans Windows throttles/drops the hook chain and input stops.
+//
+// Fixes:
+//   1. ONE listener at a time, enforced by the scannerSettingUp guard
+//      (previously declared but never used).
+//   2. killListener() actually waits for the child process 'close' before
+//      creating a new one, with a SIGKILL hard-fallback.
+//   3. Death detection uses the library's supported config.windows.onError
+//      hook AND the correct internal path (keyServer.proc, not _keyServer.proc
+//      which never existed — the old crash handler silently did nothing).
+//   4. killAllKeyServers() taskkill sweep on startup and shutdown removes any
+//      orphans (manufacturer point 3).
+//   5. SIGHUP / console-close handled so hooks are released on forced close
+//      (manufacturer points 1 & 2).
+//   6. Removed the redundant re-arm inside resetUSBDevice().then() — the
+//      health monitor is the single fallback path.
+// ============================================================
 
 const mqtt   = require('mqtt');
 const axios  = require('axios');
 const fs     = require('fs');
 const path   = require('path');
 const WebSocket = require('ws');
+const { exec } = require('child_process');
 const { GlobalKeyboardListener } = require('node-global-key-listener'); // ✅ global hook
 
 // ============================================
 // LOAD MACHINE CONFIG
 // ============================================
-// const machineConfigPath = path.join('C:\\Users\\YY', 'machine-config.json');
-
-// if (!fs.existsSync(machineConfigPath)) {
-//   console.error(`❌ Config file not found: ${machineConfigPath}`);
-//   console.error('Please create machine-config.json with: { "deviceId": "RVM-XXXX" }');
-//   process.exit(1);
-// }
-
-// const machineConfig = JSON.parse(fs.readFileSync(machineConfigPath, 'utf8'));
 const DEVICE_ID = "RVM-3101-0002";
 
 if (!DEVICE_ID) {
@@ -83,7 +99,9 @@ const CONFIG = {
     scanTimeout:        200,
     processingTimeout:  25000,
     debug:              false,
-    healthCheckInterval: 5000
+    healthCheckInterval: 5000,
+    killWaitTimeout:    1500,   // ✅ max wait for WinKeyServer to die before SIGKILL
+    setupSettle:        300     // ✅ pause between kill and re-create
   },
 
   motors: {
@@ -173,7 +191,8 @@ const state = {
   lastKeyboardActivity: Date.now(),
   scannerHealthTimer:   null,
   lastScannerRestart:   Date.now(),
-  scannerSettingUp:     false,   // ✅ guard: only one setup at a time (prevents double-scan)
+  scannerSettingUp:     false,   // ✅ guard: only one setup at a time (now actually used)
+  shuttingDown:         false,   // ✅ suppress restarts during shutdown
 
   // Session (extended for member + guest)
   sessionId:        null,
@@ -271,8 +290,7 @@ function logDetectionStats() {
 }
 
 // ============================================
-// QR SCANNER  (✅ NEW — uses GlobalKeyboardListener,
-//              works even when UI window has focus)
+// QR SCANNER  (✅ rewritten lifecycle — single guarded listener)
 // ============================================
 
 function canAcceptQRScan() {
@@ -289,14 +307,60 @@ function clearQRProcessing() {
   state.qrBuffer     = '';
 }
 
+// ✅ Sweep ALL WinKeyServer.exe processes (orphans included).
+// Manufacturer point 3: terminate residual child processes / HID consumers.
+function killAllKeyServers() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve();
+    exec('taskkill /F /IM WinKeyServer.exe /T', { timeout: 5000 }, (err, stdout) => {
+      // err is expected when no process exists — ignore
+      if (stdout && /SUCCESS/i.test(stdout)) {
+        log('🧹 Swept orphan WinKeyServer process(es)', 'qr');
+      }
+      resolve();
+    });
+  });
+}
+
+// ✅ Kill the current listener and WAIT for its child process to actually die
+// before resolving. gkl.kill() only sends SIGTERM and returns immediately;
+// without this wait the dying process's hook lingers and stacks up.
+function killListener() {
+  return new Promise((resolve) => {
+    const gkl = state.globalKeyListener;
+    state.globalKeyListener = null;
+    if (!gkl) return resolve();
+
+    // Correct internal path: keyServer.proc (NOT _keyServer.proc)
+    const proc = gkl.keyServer && gkl.keyServer.proc;
+
+    try { gkl.kill(); } catch (_) { /* ignore */ }
+
+    if (proc && !proc.killed) {
+      let done = false;
+      proc.once('close', () => { if (!done) { done = true; resolve(); } });
+      proc.once('exit',  () => { if (!done) { done = true; resolve(); } });
+      // Hard fallback — force kill if it refuses to die
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          try { proc.kill('SIGKILL'); } catch (_) {}
+          resolve();
+        }
+      }, CONFIG.qr.killWaitTimeout);
+    } else {
+      // No proc handle — give the OS a moment, then continue
+      setTimeout(resolve, 500);
+    }
+  });
+}
+
+// ✅ Guarded restart — always goes through setupQRScanner so only one
+// teardown/recreate runs at a time.
 function forceRestartScanner() {
   log('🔄 Restarting QR scanner...', 'warning');
   clearQRProcessing();
-  if (state.globalKeyListener) {
-    try { state.globalKeyListener.kill(); } catch (e) { /* ignore */ }
-    state.globalKeyListener = null;
-  }
-  setTimeout(() => setupQRScanner(), 1000);
+  setupQRScanner();
 }
 
 function startScannerHealthMonitor() {
@@ -309,10 +373,14 @@ function startScannerHealthMonitor() {
       clearQRProcessing();
     }
 
+    // Don't interfere while a setup is in progress or during shutdown
+    if (state.scannerSettingUp || state.shuttingDown) return;
+
     // Only check scanner when system is idle (not in session)
     if (!canAcceptQRScan()) return;
 
-    // Restart only if listener object is gone (process crashed)
+    // Restart only if listener object is gone (process crashed) — this is the
+    // SINGLE fallback recovery path.
     if (!state.globalKeyListener) {
       log('💊 Listener gone — restarting QR scanner...', 'warning');
       forceRestartScanner();
@@ -412,8 +480,6 @@ async function processQRCode(qrData) {
 // Only works if run as Administrator
 async function resetUSBDevice() {
   return new Promise((resolve) => {
-    const { exec } = require('child_process');
-
     // Use separate string building to avoid regex-in-template-literal parse issues
     const psScript = [
       '$dev = Get-PnpDevice | Where-Object {',
@@ -443,18 +509,29 @@ async function resetUSBDevice() {
   });
 }
 
-function setupQRScanner() {
+// ✅ Single guarded setup path. Enforces one listener at a time via
+// scannerSettingUp, waits for the old process to die, then creates exactly
+// one new listener.
+async function setupQRScanner() {
   if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
+  if (state.shuttingDown) return;
 
-  // Kill existing listener if any
-  if (state.globalKeyListener) {
-    try { state.globalKeyListener.kill(); } catch (e) { /* ignore */ }
-    state.globalKeyListener = null;
-    setTimeout(() => createKeyboardListener(), 800);
+  if (state.scannerSettingUp) {
+    log('Scanner setup already in progress — skipping duplicate request', 'warning');
     return;
   }
+  state.scannerSettingUp = true;
 
-  createKeyboardListener();
+  try {
+    await killListener();                 // wait for old child to fully die
+    await delay(CONFIG.qr.setupSettle);   // let OS release the hook
+    if (state.shuttingDown) return;
+    createKeyboardListener();             // exactly ONE new listener
+  } catch (e) {
+    log(`Scanner setup error: ${e.message}`, 'error');
+  } finally {
+    state.scannerSettingUp = false;
+  }
 }
 
 function createKeyboardListener() {
@@ -472,7 +549,19 @@ function createKeyboardListener() {
   const isConsoleOutput = (text) => CONSOLE_PATTERNS.some(p => p.test(text));
 
   try {
-    const gkl = new GlobalKeyboardListener();
+    // ✅ Use the library's supported death-detection hook (onError fires on the
+    // child's 'close' event). This replaces the old _keyServer.proc digging,
+    // which used a non-existent path and therefore never worked.
+    const gkl = new GlobalKeyboardListener({
+      windows: {
+        onError: (errorCode) => {
+          // Only react if THIS listener is still the active one
+          if (state.globalKeyListener !== gkl) return;
+          log(`⚠️ WinKeyServer exited (code: ${errorCode}) — marking dead`, 'warning');
+          state.globalKeyListener = null;  // health monitor will re-arm it
+        }
+      }
+    });
 
     gkl.addListener((e) => {
       if (e.state !== 'DOWN') return;
@@ -544,33 +633,11 @@ function createKeyboardListener() {
       }
     });
 
-    state.globalKeyListener   = gkl;
+    state.globalKeyListener    = gkl;
     state.lastScannerRestart   = Date.now();
     state.lastKeyboardActivity = Date.now();
     log('✅ QR keyboard listener created — works with UI open', 'success');
     log('📱 Ready — scan QR code now', 'qr');
-
-    // ✅ Detect when WinKeyServer.exe crashes silently (e.g. after motor USB noise)
-    // The underlying process emits 'close' when it dies
-    try {
-      const proc = gkl._keyServer && gkl._keyServer.proc;
-      if (proc) {
-        proc.on('close', (code) => {
-          log(`⚠️ WinKeyServer process exited (code: ${code}) — will restart`, 'warning');
-          state.globalKeyListener = null;  // mark as dead so health monitor restarts it
-          if (canAcceptQRScan()) {
-            setTimeout(() => forceRestartScanner(), 1000);
-          }
-        });
-        proc.on('error', (err) => {
-          log(`⚠️ WinKeyServer process error: ${err.message} — will restart`, 'warning');
-          state.globalKeyListener = null;
-          if (canAcceptQRScan()) {
-            setTimeout(() => forceRestartScanner(), 1000);
-          }
-        });
-      }
-    } catch (_) { /* ignore — process monitoring is best-effort */ }
 
   } catch (error) {
     log(`❌ Failed to create keyboard listener: ${error.message}`, 'error');
@@ -752,6 +819,7 @@ function runDiagnostics() {
 
   console.log('\n📱 QR Scanner:');
   console.log(`   Listener:    ${state.globalKeyListener ? '✅ ACTIVE' : '❌ INACTIVE'}`);
+  console.log(`   SettingUp:   ${state.scannerSettingUp ? '⏳ YES' : '✅ NO'}`);
   console.log(`   Processing:  ${state.processingQR ? '⏳ YES' : '✅ NO'}`);
   console.log(`   Can scan:    ${canAcceptQRScan() ? '✅ YES' : '❌ NO'}`);
   console.log(`   Buffer:      "${state.qrBuffer}"`);
@@ -1162,20 +1230,17 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
-    // ✅ Re-arm the QR scanner WITHOUT the heavy Windows PnP USB reset.
-    // The old code ran resetUSBDevice() (Disable/Enable-PnpDevice) on EVERY
-    // session reset. That PowerShell child process stalls the Node event loop
-    // for a second or two, and if the next QR scan starts a session during
-    // that stall, the first belt move's `await delay(1800)` fires late and the
-    // belt overshoots/undershoots — exactly the "first item after QR" symptom.
+    // ✅ Re-arm the QR scanner ONCE through the guarded setup path.
+    // setupQRScanner() now: (a) refuses to run if another setup is in flight,
+    // (b) waits for the old WinKeyServer child to fully die before creating a
+    // new one, (c) creates exactly one listener. This is the ONLY place we
+    // re-arm on reset — no proc.close handler and no USB-reset callback also
+    // spawn listeners anymore, so we never stack hooks.
     //
-    // setupQRScanner() already does a clean taskkill + fresh single listener,
-    // which is enough to recover the scanner after normal motor activity.
-    // The expensive PnP reset is now reserved for the case where the listener
-    // genuinely fails to come back (checked below), so it never collides with
-    // a fresh session's belt timing.
-    log('🔄 Re-arming QR scanner (light)...', 'qr');
-    clearQRProcessing();
+    // The expensive Windows PnP USB reset is reserved for the case where the
+    // listener genuinely fails to recover (fallback below), and it runs while
+    // idle so it can't stall a fresh session's belt timing.
+    log('🔄 Re-arming QR scanner (single guarded setup)...', 'qr');
     setupQRScanner();
 
     console.log('='.repeat(50));
@@ -1194,17 +1259,16 @@ async function resetSystemForNextUser(forceStop = false) {
 
     log('✅ System ready for next user', 'success');
     log(`⏱️ Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
-    // ✅ Fallback recovery: only if the light re-arm above did NOT bring the
-    // listener back. This is the ONLY place the heavy PnP USB reset can run,
-    // and it runs while idle (no session active), so it can't stall a belt move.
-    setTimeout(() => {
+
+    // ✅ Fallback recovery: only if the guarded re-arm above did NOT bring the
+    // listener back. This is the ONLY place the heavy PnP USB reset runs, while
+    // idle. It does NOT call setupQRScanner() itself — after the device returns
+    // the health monitor (which sees globalKeyListener === null) re-arms once.
+    setTimeout(async () => {
       if (state.isReady && !state.autoCycleEnabled && !state.globalKeyListener && !state.scannerSettingUp) {
         log('💊 Listener did not recover — running full USB reset...', 'qr');
-        resetUSBDevice().then(() => {
-          setTimeout(() => {
-            if (!state.autoCycleEnabled) setupQRScanner();
-          }, 2000);
-        });
+        await resetUSBDevice();
+        // No setupQRScanner() here — health monitor handles the single re-arm.
       }
     }, 4000);
   }
@@ -1402,7 +1466,7 @@ const mqttClient = mqtt.connect(CONFIG.mqtt.brokerUrl, {
   rejectUnauthorized: false
 });
 
-mqttClient.on('connect', () => {
+mqttClient.on('connect', async () => {
   log('✅ MQTT connected', 'success');
 
   mqttClient.subscribe(CONFIG.mqtt.topics.commands);
@@ -1434,8 +1498,14 @@ mqttClient.on('connect', () => {
   log('📤 Initial bin status published', 'info');
 
   connectWebSocket();
-  setupQRScanner();     // ✅ start QR scanner immediately
-  startScannerHealthMonitor(); // ✅ auto-heal if listener dies
+
+  // ✅ Sweep any orphan WinKeyServer.exe left by a previous crash/forced close
+  // BEFORE starting our own (manufacturer point 3 — no residual HID consumers).
+  await killAllKeyServers();
+  await delay(300);
+
+  await setupQRScanner();       // ✅ guarded single listener
+  startScannerHealthMonitor();  // ✅ single fallback recovery path
   heartbeat.start();
 });
 
@@ -1565,33 +1635,53 @@ mqttClient.on('message', async (topic, message) => {
 mqttClient.on('error', (error) => log(`MQTT error: ${error.message}`, 'error'));
 
 // ============================================
-// SHUTDOWN
+// SHUTDOWN  (✅ now releases hooks + sweeps orphans)
 // ============================================
-function gracefulShutdown() {
+let shutdownInProgress = false;
+async function gracefulShutdown() {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  state.shuttingDown = true;
+
   console.log('\n⏹️  Shutting down...\n');
   heartbeat.stop();
-  stopCompactor();
+  if (state.scannerHealthTimer) { clearInterval(state.scannerHealthTimer); state.scannerHealthTimer = null; }
+
+  try { await stopCompactor(); } catch (_) {}
   if (state.autoPhotoTimer) clearTimeout(state.autoPhotoTimer);
   clearSessionTimers();
   clearQRProcessing();
 
-  if (state.globalKeyListener) {
-    try { state.globalKeyListener.kill(); } catch (_) {}
-  }
-  if (state.scannerHealthTimer) clearInterval(state.scannerHealthTimer);
+  // ✅ Manufacturer points 1 & 2: ensure the keyboard hook + raw input handles
+  // are released. Kill the tracked listener, then sweep any orphans so no
+  // WinKeyServer.exe survives with a live SetWindowsHookEx hook.
+  try { await killListener(); } catch (_) {}
+  try { await killAllKeyServers(); } catch (_) {}
 
-  mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
-    deviceId: CONFIG.device.id, status: 'offline', timestamp: new Date().toISOString()
-  }), { retain: true });
+  try {
+    mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
+      deviceId: CONFIG.device.id, status: 'offline', timestamp: new Date().toISOString()
+    }), { retain: true });
+  } catch (_) {}
 
   if (state.ws) { try { state.ws.close(); } catch (_) {} }
-  setTimeout(() => { mqttClient.end(); process.exit(0); }, 1000);
+  setTimeout(() => { try { mqttClient.end(); } catch (_) {} process.exit(0); }, 1000);
 }
 
 process.on('SIGINT',  gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
+process.on('SIGHUP',  gracefulShutdown);   // ✅ console window closed / hangup
 process.on('uncaughtException',  (e) => { log(`Uncaught: ${e.message}`, 'error'); console.error(e); gracefulShutdown(); });
-process.on('unhandledRejection', (e) => { log(`Unhandled: ${e.message}`, 'error'); console.error(e); });
+process.on('unhandledRejection', (e) => { log(`Unhandled: ${e && e.message}`, 'error'); console.error(e); });
+
+// ✅ On Windows, surface CTRL+CLOSE / window-close as SIGINT so the hook is
+// unregistered before the process dies (manufacturer point 1).
+if (process.platform === 'win32') {
+  try {
+    const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('SIGINT', () => process.emit('SIGINT'));
+  } catch (_) { /* stdin may be unavailable under some launchers */ }
+}
 
 // ============================================
 // STARTUP
@@ -1601,10 +1691,10 @@ console.log('🚀 RVM AGENT — GUEST + MEMBER (QR)');
 console.log('='.repeat(55));
 console.log(`Device:    ${CONFIG.device.id}`);
 console.log(`Module ID: ${HARDCODED_MODULE_ID} (HARDCODED)`);
-// console.log(`Config:    ${machineConfigPath}`);
-console.log('QR:        ✅ GlobalKeyboardListener (works with UI open)');
+console.log('QR:        ✅ GlobalKeyboardListener (single guarded listener)');
 console.log('Guest:     ✅ press Start button as before');
 console.log('Member:    ✅ scan QR code to start session');
 console.log('Timings:   ⚡ optimized (same as guest-only agent)');
 console.log('Bins:      ✅ retain + qos:1');
+console.log('Scanner:   ✅ kill-and-wait + orphan sweep + hook release on exit');
 console.log('='.repeat(55) + '\n');

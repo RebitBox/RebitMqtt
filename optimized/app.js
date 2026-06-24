@@ -103,7 +103,7 @@ const CONFIG = {
     beltReverse: 3500,
     stepperRotate: 2200,
     stepperReset: 2200,        // ⚡ was 3000 - same as stepperRotate
-    compactorIdleStop: 20000,
+    compactorIdleStop: 10000,
     positionSettle: 100,       // ⚡ was 200 - belt stops within 100ms
     gateOperation: 600,
     autoPhotoDelay: 2500,

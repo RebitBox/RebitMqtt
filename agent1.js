@@ -6,28 +6,29 @@
 // Added: qrInput MQTT topic subscription
 //
 // ============================================================
-// SCANNER LIFECYCLE FIX (scanner dies after 4-5 scans)
+// SCANNER LIFECYCLE FIX v2 (scanner stops after 7-8 scans)
 // ============================================================
-// Root cause: every session reset spawned 2-3 WinKeyServer.exe processes
-// (setupQRScanner + proc.close handler + health monitor + USB-reset callback
-// all racing), and gkl.kill() did not wait for the old process to die. Each
-// orphaned WinKeyServer holds its own SetWindowsHookEx low-level keyboard hook;
-// after a few scans Windows throttles/drops the hook chain and input stops.
+// Root cause of the 7-8 scan ceiling: setupQRScanner() ran on EVERY session
+// reset (resetSystemForNextUser), and also via forceRestartScanner() and the
+// post-motor recovery. Each recreate spawned a new WinKeyServer.exe child, and
+// any single imperfect teardown left an orphan. Orphans accumulate across
+// sessions; each holds its own SetWindowsHookEx low-level keyboard hook; after
+// a handful of sessions Windows throttles/drops the hook chain and input stops.
 //
-// Fixes:
-//   1. ONE listener at a time, enforced by the scannerSettingUp guard
-//      (previously declared but never used).
-//   2. killListener() actually waits for the child process 'close' before
-//      creating a new one, with a SIGKILL hard-fallback.
-//   3. Death detection uses the library's supported config.windows.onError
-//      hook AND the correct internal path (keyServer.proc, not _keyServer.proc
-//      which never existed — the old crash handler silently did nothing).
-//   4. killAllKeyServers() taskkill sweep on startup and shutdown removes any
-//      orphans (manufacturer point 3).
-//   5. SIGHUP / console-close handled so hooks are released on forced close
-//      (manufacturer points 1 & 2).
-//   6. Removed the redundant re-arm inside resetUSBDevice().then() — the
-//      health monitor is the single fallback path.
+// v2 strategy: ONE permanent listener for the life of the process.
+//   - Created once at startup.
+//   - NOT recreated on session reset (reused if still alive).
+//   - Recreated ONLY when it genuinely died (onError fired -> object null),
+//     detected by the health monitor.
+//   - killListener() still waits for the child 'close' (for the rare genuine
+//     restart) and now LOGS whether the proc handle was found, so you can
+//     confirm kill-and-wait actually works on your installed library version.
+//   - Added an activity watchdog: if the listener object is alive but has seen
+//     zero keyboard activity across a long idle window, re-arm once (catches
+//     the "alive but hook silently dead" case, e.g. throttling / IME).
+//   - USB PnP reset fallback kept as-is: it guards the real hardware fault
+//     (motor electrical noise faulting the scanner's USB), which no software
+//     hook change can fix.
 // ============================================================
 
 const mqtt   = require('mqtt');
@@ -36,7 +37,7 @@ const fs     = require('fs');
 const path   = require('path');
 const WebSocket = require('ws');
 const { exec } = require('child_process');
-const { GlobalKeyboardListener } = require('node-global-key-listener'); // ✅ global hook
+const { GlobalKeyboardListener } = require('node-global-key-listener'); // global hook
 
 // ============================================
 // LOAD MACHINE CONFIG
@@ -44,11 +45,11 @@ const { GlobalKeyboardListener } = require('node-global-key-listener'); // ✅ g
 const DEVICE_ID = "RVM-3101-0002";
 
 if (!DEVICE_ID) {
-  console.error('❌ deviceId not found in machine-config.json');
+  console.error('deviceId not found in machine-config.json');
   process.exit(1);
 }
 
-console.log(`✅ Device ID loaded: ${DEVICE_ID}`);
+console.log(`Device ID loaded: ${DEVICE_ID}`);
 
 // ============================================
 // HARDCODED MODULE ID  (unchanged)
@@ -56,7 +57,7 @@ console.log(`✅ Device ID loaded: ${DEVICE_ID}`);
 const HARDCODED_MODULE_ID = '09';
 
 // ============================================
-// CONFIGURATION  (unchanged + qr block added)
+// CONFIGURATION  (unchanged + qr block)
 // ============================================
 const CONFIG = {
   device: { id: DEVICE_ID },
@@ -85,13 +86,12 @@ const CONFIG = {
       weightResult:  `rvm/${DEVICE_ID}/weight/result`,
       status:        `rvm/${DEVICE_ID}/status`,
       screenState:   `rvm/${DEVICE_ID}/screen/state`,
-      qrInput:       `rvm/${DEVICE_ID}/qr/input`,   // ✅ new
+      qrInput:       `rvm/${DEVICE_ID}/qr/input`,
       guestStart:    `rvm/${DEVICE_ID}/guest/start`,
       binStatus:     `rvm/${DEVICE_ID}/bin/status`
     }
   },
 
-  // ✅ QR config (new)
   qr: {
     enabled:            true,
     minLength:          5,
@@ -100,8 +100,9 @@ const CONFIG = {
     processingTimeout:  25000,
     debug:              false,
     healthCheckInterval: 5000,
-    killWaitTimeout:    1500,   // ✅ max wait for WinKeyServer to die before SIGKILL
-    setupSettle:        300     // ✅ pause between kill and re-create
+    killWaitTimeout:    1500,   // max wait for WinKeyServer to die before SIGKILL
+    setupSettle:        300,    // pause between kill and re-create
+    staleActivityMs:    120000  // listener "alive" but silent this long while idle -> re-arm once
   },
 
   motors: {
@@ -136,7 +137,6 @@ const CONFIG = {
     sensorDebounce:      200
   },
 
-  // ✅ Unchanged optimised timings
   timing: {
     beltToWeight:       1800,
     beltToStepper:      1800,
@@ -169,7 +169,7 @@ const CONFIG = {
 };
 
 // ============================================
-// STATE MANAGEMENT  (unchanged + qr fields added)
+// STATE MANAGEMENT  (unchanged + qr fields)
 // ============================================
 const state = {
   moduleId: HARDCODED_MODULE_ID,
@@ -181,7 +181,6 @@ const state = {
   ws:      null,
   isReady: false,
 
-  // ✅ QR scanner state (new)
   qrBuffer:             '',
   lastCharTime:         0,
   qrTimer:              null,
@@ -191,15 +190,14 @@ const state = {
   lastKeyboardActivity: Date.now(),
   scannerHealthTimer:   null,
   lastScannerRestart:   Date.now(),
-  scannerSettingUp:     false,   // ✅ guard: only one setup at a time (now actually used)
-  shuttingDown:         false,   // ✅ suppress restarts during shutdown
+  scannerSettingUp:     false,
+  shuttingDown:         false,
 
-  // Session (extended for member + guest)
   sessionId:        null,
   sessionCode:      null,
-  currentUserId:    null,   // ✅ new — null for guest
-  currentUserData:  null,   // ✅ new — null for guest
-  isMember:         false,  // ✅ new
+  currentUserId:    null,
+  currentUserData:  null,
+  isMember:         false,
   isGuestSession:   false,
   itemsProcessed:   0,
   sessionStartTime: null,
@@ -247,11 +245,11 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function log(message, level = 'info') {
   const timestamp = new Date().toISOString();
   const prefix = {
-    info: 'ℹ️', success: '✅', error: '❌', warning: '⚠️',
-    debug: '🔍', perf: '⚡', crusher: '🔨', camera: '📸',
-    detection: '🎯', qr: '📱'
-  }[level] || 'ℹ️';
-  console.log(`[${timestamp}] ${prefix} ${message}`);
+    info: 'i', success: 'OK', error: 'ERR', warning: 'WARN',
+    debug: 'DBG', perf: 'PERF', crusher: 'CRUSH', camera: 'CAM',
+    detection: 'DET', qr: 'QR'
+  }[level] || 'i';
+  console.log(`[${timestamp}] [${prefix}] ${message}`);
 }
 
 function trackCycleTime(startTime) {
@@ -286,11 +284,11 @@ function logDetectionStats() {
   const total = s.firstTimeSuccess + s.secondTimeSuccess + s.thirdTimeSuccess + s.failures;
   if (total === 0) return;
   const r = ((s.firstTimeSuccess / total) * 100).toFixed(1);
-  log(`📊 Detection: ${s.totalAttempts} total | ${r}% first-time | Avg retries: ${s.averageRetries.toFixed(2)}`, 'detection');
+  log(`Detection: ${s.totalAttempts} total | ${r}% first-time | Avg retries: ${s.averageRetries.toFixed(2)}`, 'detection');
 }
 
 // ============================================
-// QR SCANNER  (✅ rewritten lifecycle — single guarded listener)
+// QR SCANNER  (v2 — single permanent listener)
 // ============================================
 
 function canAcceptQRScan() {
@@ -307,32 +305,32 @@ function clearQRProcessing() {
   state.qrBuffer     = '';
 }
 
-// ✅ Sweep ALL WinKeyServer.exe processes (orphans included).
-// Manufacturer point 3: terminate residual child processes / HID consumers.
+// Sweep ALL WinKeyServer.exe processes (orphans included).
 function killAllKeyServers() {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve();
     exec('taskkill /F /IM WinKeyServer.exe /T', { timeout: 5000 }, (err, stdout) => {
-      // err is expected when no process exists — ignore
       if (stdout && /SUCCESS/i.test(stdout)) {
-        log('🧹 Swept orphan WinKeyServer process(es)', 'qr');
+        log('Swept orphan WinKeyServer process(es)', 'qr');
       }
       resolve();
     });
   });
 }
 
-// ✅ Kill the current listener and WAIT for its child process to actually die
-// before resolving. gkl.kill() only sends SIGTERM and returns immediately;
-// without this wait the dying process's hook lingers and stacks up.
+// Kill the current listener and WAIT for its child process to actually die.
+// Logs whether the proc handle was found so you can confirm kill-and-wait
+// works on your installed node-global-key-listener version. If it logs
+// MISSING, check node_modules/node-global-key-listener/dist for the real
+// property name and update the `proc` line below.
 function killListener() {
   return new Promise((resolve) => {
     const gkl = state.globalKeyListener;
     state.globalKeyListener = null;
     if (!gkl) return resolve();
 
-    // Correct internal path: keyServer.proc (NOT _keyServer.proc)
     const proc = gkl.keyServer && gkl.keyServer.proc;
+    log(`killListener: proc handle ${proc ? 'FOUND' : 'MISSING'}`, 'debug');
 
     try { gkl.kill(); } catch (_) { /* ignore */ }
 
@@ -340,7 +338,6 @@ function killListener() {
       let done = false;
       proc.once('close', () => { if (!done) { done = true; resolve(); } });
       proc.once('exit',  () => { if (!done) { done = true; resolve(); } });
-      // Hard fallback — force kill if it refuses to die
       setTimeout(() => {
         if (!done) {
           done = true;
@@ -349,16 +346,15 @@ function killListener() {
         }
       }, CONFIG.qr.killWaitTimeout);
     } else {
-      // No proc handle — give the OS a moment, then continue
       setTimeout(resolve, 500);
     }
   });
 }
 
-// ✅ Guarded restart — always goes through setupQRScanner so only one
-// teardown/recreate runs at a time.
+// Guarded restart — always goes through setupQRScanner so only one
+// teardown/recreate runs at a time. Used ONLY for genuine death/manual restart.
 function forceRestartScanner() {
-  log('🔄 Restarting QR scanner...', 'warning');
+  log('Restarting QR scanner...', 'warning');
   clearQRProcessing();
   setupQRScanner();
 }
@@ -369,7 +365,7 @@ function startScannerHealthMonitor() {
 
     // Clear stuck processing state
     if (state.processingQR && !state.processingQRTimeout) {
-      log('⚠️ processingQR stuck — clearing', 'warning');
+      log('processingQR stuck — clearing', 'warning');
       clearQRProcessing();
     }
 
@@ -379,10 +375,21 @@ function startScannerHealthMonitor() {
     // Only check scanner when system is idle (not in session)
     if (!canAcceptQRScan()) return;
 
-    // Restart only if listener object is gone (process crashed) — this is the
-    // SINGLE fallback recovery path.
+    // (1) Listener object gone (onError fired / process crashed) -> re-arm once.
     if (!state.globalKeyListener) {
-      log('💊 Listener gone — restarting QR scanner...', 'warning');
+      log('Listener gone — re-arming QR scanner (single setup)...', 'warning');
+      forceRestartScanner();
+      return;
+    }
+
+    // (2) Listener object alive but hook silently dead: no keyboard activity
+    // for a long idle window. Re-arm once. This catches Windows throttling /
+    // IME interception where onError never fires.
+    const silentMs = Date.now() - state.lastKeyboardActivity;
+    if (silentMs > CONFIG.qr.staleActivityMs) {
+      log(`Listener alive but silent for ${Math.round(silentMs/1000)}s while idle — re-arming once...`, 'warning');
+      // Bump the timestamp first so we don't loop-restart every tick.
+      state.lastKeyboardActivity = Date.now();
       forceRestartScanner();
     }
 
@@ -416,16 +423,15 @@ async function processQRCode(qrData) {
     return;
   }
 
-  // Mark busy immediately — prevents double-scan
   state.processingQR = true;
   state.processingQRTimeout = setTimeout(() => {
     log('QR processing timeout', 'warning');
     clearQRProcessing();
   }, CONFIG.qr.processingTimeout);
 
-  log(`\n${'='.repeat(50)}`, 'qr');
+  log(`${'='.repeat(50)}`, 'qr');
   log(`QR CODE: ${cleanCode}`, 'qr');
-  log(`${'='.repeat(50)}\n`, 'qr');
+  log(`${'='.repeat(50)}`, 'qr');
 
   let sessionStarted = false;
 
@@ -445,7 +451,6 @@ async function processQRCode(qrData) {
       }));
 
       await delay(1500);
-      // Clear BEFORE handing off — startMemberSession sets isReady=false immediately
       clearQRProcessing();
       sessionStarted = true;
       await startMemberSession(validation);
@@ -475,12 +480,10 @@ async function processQRCode(qrData) {
   }
 }
 
-// ✅ Force Windows USB device reset
-// Fixes QR scanner getting stuck after motor electrical noise
-// Only works if run as Administrator
+// Force Windows USB device reset. Fixes QR scanner getting stuck after motor
+// electrical noise. Only works if run as Administrator.
 async function resetUSBDevice() {
   return new Promise((resolve) => {
-    // Use separate string building to avoid regex-in-template-literal parse issues
     const psScript = [
       '$dev = Get-PnpDevice | Where-Object {',
       '  $_.InstanceId -like "*VID_0525*" -and',
@@ -504,14 +507,15 @@ async function resetUSBDevice() {
       } else {
         log('USB reset: ' + stdout.trim(), 'qr');
       }
-      resolve(); // always continue even if reset fails
+      resolve();
     });
   });
 }
 
-// ✅ Single guarded setup path. Enforces one listener at a time via
+// Single guarded setup path. Enforces one listener at a time via
 // scannerSettingUp, waits for the old process to die, then creates exactly
-// one new listener.
+// one new listener. In v2 this runs ONCE at startup and only again if the
+// listener genuinely died.
 async function setupQRScanner() {
   if (!CONFIG.qr.enabled) { log('QR scanner disabled', 'warning'); return; }
   if (state.shuttingDown) return;
@@ -536,10 +540,9 @@ async function setupQRScanner() {
 
 function createKeyboardListener() {
   console.log('\n' + '='.repeat(50));
-  console.log('📱 QR SCANNER — CREATING LISTENER');
+  console.log('QR SCANNER — CREATING LISTENER');
   console.log('='.repeat(50) + '\n');
 
-  // Filter out console/system text that might accidentally build a buffer
   const CONSOLE_PATTERNS = [
     /^C:\\/i, /^[A-Z]:\\/i,
     /operable program/i, /batch file/i,
@@ -549,15 +552,11 @@ function createKeyboardListener() {
   const isConsoleOutput = (text) => CONSOLE_PATTERNS.some(p => p.test(text));
 
   try {
-    // ✅ Use the library's supported death-detection hook (onError fires on the
-    // child's 'close' event). This replaces the old _keyServer.proc digging,
-    // which used a non-existent path and therefore never worked.
     const gkl = new GlobalKeyboardListener({
       windows: {
         onError: (errorCode) => {
-          // Only react if THIS listener is still the active one
           if (state.globalKeyListener !== gkl) return;
-          log(`⚠️ WinKeyServer exited (code: ${errorCode}) — marking dead`, 'warning');
+          log(`WinKeyServer exited (code: ${errorCode}) — marking dead`, 'warning');
           state.globalKeyListener = null;  // health monitor will re-arm it
         }
       }
@@ -572,7 +571,6 @@ function createKeyboardListener() {
 
       const now = Date.now();
 
-      // ENTER — scanner always sends this after every scan
       if (e.name === 'RETURN' || e.name === 'ENTER') {
         if (
           state.qrBuffer.length >= CONFIG.qr.minLength &&
@@ -593,10 +591,8 @@ function createKeyboardListener() {
         return;
       }
 
-      // Single printable character
       const char = e.name;
       if (char.length === 1) {
-        // Reset buffer on gap between chars (scanner sends <5ms apart)
         if ((now - state.lastCharTime) > CONFIG.qr.scanTimeout && state.qrBuffer.length > 0) {
           state.qrBuffer = '';
         }
@@ -610,7 +606,6 @@ function createKeyboardListener() {
         state.qrBuffer    += char;
         state.lastCharTime = now;
 
-        // Auto-submit fallback for scanners that omit ENTER
         if (state.qrTimer) clearTimeout(state.qrTimer);
         state.qrTimer = setTimeout(() => {
           state.qrTimer = null;
@@ -636,11 +631,11 @@ function createKeyboardListener() {
     state.globalKeyListener    = gkl;
     state.lastScannerRestart   = Date.now();
     state.lastKeyboardActivity = Date.now();
-    log('✅ QR keyboard listener created — works with UI open', 'success');
-    log('📱 Ready — scan QR code now', 'qr');
+    log('QR keyboard listener created — works with UI open', 'success');
+    log('Ready — scan QR code now', 'qr');
 
   } catch (error) {
-    log(`❌ Failed to create keyboard listener: ${error.message}`, 'error');
+    log(`Failed to create keyboard listener: ${error.message}`, 'error');
     state.globalKeyListener = null;
   }
 }
@@ -655,10 +650,10 @@ async function startContinuousCompactor() {
     await executeCommand('customMotor', CONFIG.motors.compactor.start);
     state.compactorRunning = true;
     state.lastItemTime = Date.now();
-    log('🔨 Compactor started', 'crusher');
+    log('Compactor started', 'crusher');
     resetCompactorIdleTimer();
   } catch (error) {
-    log(`❌ Failed to start compactor: ${error.message}`, 'error');
+    log(`Failed to start compactor: ${error.message}`, 'error');
     state.compactorRunning = false;
     throw error;
   }
@@ -669,7 +664,7 @@ function resetCompactorIdleTimer() {
   state.lastItemTime = Date.now();
   state.compactorIdleTimer = setTimeout(async () => {
     if (state.compactorRunning && state.autoCycleEnabled) {
-      log('🔨 No items — stopping compactor (idle)', 'crusher');
+      log('No items — stopping compactor (idle)', 'crusher');
       await stopCompactor();
     }
   }, CONFIG.timing.compactorIdleStop);
@@ -677,7 +672,7 @@ function resetCompactorIdleTimer() {
 
 async function stopCompactor() {
   if (!state.compactorRunning) return;
-  try { await executeCommand('customMotor', CONFIG.motors.compactor.stop); log('🔨 Compactor stopped', 'crusher'); }
+  try { await executeCommand('customMotor', CONFIG.motors.compactor.stop); log('Compactor stopped', 'crusher'); }
   catch (error) { log(`Compactor stop error: ${error.message}`, 'error'); }
   state.compactorRunning = false;
   if (state.compactorTimer)    { clearTimeout(state.compactorTimer);    state.compactorTimer    = null; }
@@ -698,20 +693,20 @@ async function scheduleNextPhotoWithPositioning() {
         await delay(CONFIG.timing.positionSettle);
       } catch (error) { log(`Belt pre-stop error: ${error.message}`, 'error'); }
 
-      log('🔍 Checking weight for item presence...', 'info');
+      log('Checking weight for item presence...', 'info');
 
       try {
         await executeCommand('getWeight');
         await delay(CONFIG.timing.weightDelay);
 
         if (!state.weight || state.weight.weight < CONFIG.detection.minValidWeight) {
-          log(`⚖️ No item (weight: ${state.weight ? state.weight.weight + 'g' : 'null'}) — waiting`, 'debug');
+          log(`No item (weight: ${state.weight ? state.weight.weight + 'g' : 'null'}) — waiting`, 'debug');
           state.weight = null;
           if (state.autoCycleEnabled) await scheduleNextPhotoWithPositioning();
           return;
         }
 
-        log(`✅ Item detected (${state.weight.weight}g) — positioning`, 'success');
+        log(`Item detected (${state.weight.weight}g) — positioning`, 'success');
         state.weight = null;
 
       } catch (error) {
@@ -725,23 +720,23 @@ async function scheduleNextPhotoWithPositioning() {
 
       try {
         if (CONFIG.detection.positionBeforePhoto) {
-          log('🔄 [STEP 1] Moving belt to camera position...', 'info');
+          log('[STEP 1] Moving belt to camera position...', 'info');
           const beltStartTime = Date.now();
           await executeCommand('customMotor', CONFIG.motors.belt.toWeight);
           await delay(CONFIG.timing.beltToWeight);
-          log(`🛑 [STEP 2] Stopping belt (ran for ${Date.now() - beltStartTime}ms)...`, 'info');
+          log(`[STEP 2] Stopping belt (ran for ${Date.now() - beltStartTime}ms)...`, 'info');
           await executeCommand('customMotor', CONFIG.motors.belt.stop);
           await delay(CONFIG.timing.positionSettle);
           state.itemAlreadyPositioned = true;
-          log('✅ [STEP 3] Item at camera — ready for photo', 'camera');
+          log('[STEP 3] Item at camera — ready for photo', 'camera');
         }
 
-        log('📸 [STEP 4] Taking photo...', 'camera');
+        log('[STEP 4] Taking photo...', 'camera');
         await executeCommand('takePhoto');
-        log('📸 Photo sent — awaiting AI result', 'camera');
+        log('Photo sent — awaiting AI result', 'camera');
 
       } catch (error) {
-        log(`❌ Photo positioning error: ${error.message}`, 'error');
+        log(`Photo positioning error: ${error.message}`, 'error');
         state.awaitingDetection    = false;
         state.itemAlreadyPositioned = false;
         state.weight = null;
@@ -758,8 +753,8 @@ async function scheduleNextPhotoWithPositioning() {
 function checkSystemHealth() {
   const status    = state.autoCycleEnabled ? 'ACTIVE' : 'IDLE';
   const compactor = state.compactorRunning ? 'ON' : 'OFF';
-  const qr        = canAcceptQRScan() ? '📱 READY' : '📱 BUSY';
-  log(`💓 System: ${status} | Compactor: ${compactor} | QR: ${qr}`, 'info');
+  const qr        = canAcceptQRScan() ? 'READY' : 'BUSY';
+  log(`System: ${status} | Compactor: ${compactor} | QR: ${qr}`, 'info');
 }
 
 // ============================================
@@ -803,9 +798,9 @@ const heartbeat = {
     }));
 
     const sessionStatus   = state.autoCycleEnabled ? 'ACTIVE' : 'IDLE';
-    const compactorStatus = state.compactorRunning ? '🔨' : '⚪';
-    const qrStatus        = canAcceptQRScan() ? '📱' : '🔒';
-    console.log(`💓 ${state.moduleId} | ${sessionStatus} | ${compactorStatus} | ${qrStatus}`);
+    const compactorStatus = state.compactorRunning ? 'CRUSH' : '-';
+    const qrStatus        = canAcceptQRScan() ? 'QR-OK' : 'QR-LOCK';
+    console.log(`HB ${state.moduleId} | ${sessionStatus} | ${compactorStatus} | ${qrStatus}`);
   }
 };
 
@@ -814,33 +809,33 @@ const heartbeat = {
 // ============================================
 function runDiagnostics() {
   console.log('\n' + '='.repeat(60));
-  console.log('🔬 SYSTEM DIAGNOSTICS');
+  console.log('SYSTEM DIAGNOSTICS');
   console.log('='.repeat(60));
 
-  console.log('\n📱 QR Scanner:');
-  console.log(`   Listener:    ${state.globalKeyListener ? '✅ ACTIVE' : '❌ INACTIVE'}`);
-  console.log(`   SettingUp:   ${state.scannerSettingUp ? '⏳ YES' : '✅ NO'}`);
-  console.log(`   Processing:  ${state.processingQR ? '⏳ YES' : '✅ NO'}`);
-  console.log(`   Can scan:    ${canAcceptQRScan() ? '✅ YES' : '❌ NO'}`);
+  console.log('\nQR Scanner:');
+  console.log(`   Listener:    ${state.globalKeyListener ? 'ACTIVE' : 'INACTIVE'}`);
+  console.log(`   SettingUp:   ${state.scannerSettingUp ? 'YES' : 'NO'}`);
+  console.log(`   Processing:  ${state.processingQR ? 'YES' : 'NO'}`);
+  console.log(`   Can scan:    ${canAcceptQRScan() ? 'YES' : 'NO'}`);
   console.log(`   Buffer:      "${state.qrBuffer}"`);
   console.log(`   Last activity: ${Math.round((Date.now()-state.lastKeyboardActivity)/1000)}s ago`);
 
-  console.log('\n👁️ Detection:');
-  console.log(`   positionBeforePhoto: ${CONFIG.detection.positionBeforePhoto ? '✅' : '❌'}`);
-  console.log(`   itemPositioned:      ${state.itemAlreadyPositioned ? '✅' : '❌'}`);
+  console.log('\nDetection:');
+  console.log(`   positionBeforePhoto: ${CONFIG.detection.positionBeforePhoto ? 'Y' : 'N'}`);
+  console.log(`   itemPositioned:      ${state.itemAlreadyPositioned ? 'Y' : 'N'}`);
 
-  console.log('\n🔨 Compactor:');
-  console.log(`   Running:   ${state.compactorRunning ? '✅ YES' : '❌ NO'}`);
+  console.log('\nCompactor:');
+  console.log(`   Running:   ${state.compactorRunning ? 'YES' : 'NO'}`);
   console.log(`   Last item: ${state.lastItemTime ? Math.round((Date.now()-state.lastItemTime)/1000)+'s ago' : 'N/A'}`);
-  console.log(`   Idle timer: ${state.compactorIdleTimer ? '⏰ ACTIVE' : '❌ NONE'}`);
+  console.log(`   Idle timer: ${state.compactorIdleTimer ? 'ACTIVE' : 'NONE'}`);
 
-  console.log('\n🗑️  Bins:');
-  console.log(`   Plastic: ${state.binStatus.plastic ? '❌ FULL' : '✅ OK'}`);
-  console.log(`   Metal:   ${state.binStatus.metal   ? '❌ FULL' : '✅ OK'}`);
-  console.log(`   Right:   ${state.binStatus.right   ? '❌ FULL' : '✅ OK'}`);
-  console.log(`   Glass:   ${state.binStatus.glass   ? '❌ FULL' : '✅ OK'}`);
+  console.log('\nBins:');
+  console.log(`   Plastic: ${state.binStatus.plastic ? 'FULL' : 'OK'}`);
+  console.log(`   Metal:   ${state.binStatus.metal   ? 'FULL' : 'OK'}`);
+  console.log(`   Right:   ${state.binStatus.right   ? 'FULL' : 'OK'}`);
+  console.log(`   Glass:   ${state.binStatus.glass   ? 'FULL' : 'OK'}`);
 
-  console.log('\n🎯 System:');
+  console.log('\nSystem:');
   console.log(`   deviceId:  ${CONFIG.device.id}`);
   console.log(`   moduleId:  ${state.moduleId} (HARDCODED)`);
   console.log(`   isReady:   ${state.isReady}`);
@@ -897,15 +892,15 @@ function determineMaterialType(aiData) {
   if (materialType !== 'UNKNOWN' && probability < threshold) {
     const relaxed = detectionFormat === 'new_standard' ? threshold * 0.70 : threshold * 0.80;
     if (hasStrongKeyword && probability >= relaxed) {
-      log(`🎯 ${materialType} (${pct}% keyword)`, 'detection'); return materialType;
+      log(`${materialType} (${pct}% keyword)`, 'detection'); return materialType;
     }
     if (detectionFormat === 'new_standard' && probability >= 0.45) {
-      log(`🎯 ${materialType} (${pct}% standard)`, 'detection'); return materialType;
+      log(`${materialType} (${pct}% standard)`, 'detection'); return materialType;
     }
-    log(`❌ Low confidence: ${pct}%`, 'warning'); return 'UNKNOWN';
+    log(`Low confidence: ${pct}%`, 'warning'); return 'UNKNOWN';
   }
 
-  if (materialType !== 'UNKNOWN') log(`✅ ${materialType} (${pct}%)`, 'detection');
+  if (materialType !== 'UNKNOWN') log(`${materialType} (${pct}%)`, 'detection');
   return materialType;
 }
 
@@ -920,11 +915,11 @@ async function executeCommand(action, params = {}) {
     case 'openGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
       apiPayload = { moduleId: state.moduleId, motorId: '01', type: '03', deviceType };
-      log('🚪 Opening gate...', 'info'); break;
+      log('Opening gate...', 'info'); break;
     case 'closeGate':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/motorSelect`;
       apiPayload = { moduleId: state.moduleId, motorId: '01', type: '01', deviceType };
-      log('🚪 Closing gate...', 'info'); break;
+      log('Closing gate...', 'info'); break;
     case 'getWeight':
       apiUrl = `${CONFIG.local.baseUrl}/system/serial/getWeight`;
       apiPayload = { moduleId: state.moduleId, type: '00' }; break;
@@ -954,13 +949,17 @@ async function executeCommand(action, params = {}) {
   }
 }
 
-// ✅ Call this after motor cycles complete to recover USB scanner
+// Call this after motor cycles complete to recover USB scanner.
+// v2: does NOT tear down a healthy listener. Recreating the software hook does
+// nothing for a motor-noise USB fault, and tearing down a working listener is
+// what caused orphan accumulation. We only run the hardware USB reset, and only
+// if the listener actually died.
 function scheduleQRRecovery() {
-  // Wait for USB to settle after motor electrical noise, then restart listener
-  setTimeout(() => {
-    if (!state.autoCycleEnabled && state.isReady) {
-      log('🔄 Post-motor QR recovery...', 'qr');
-      forceRestartScanner();
+  setTimeout(async () => {
+    if (!state.autoCycleEnabled && state.isReady && !state.globalKeyListener && !state.scannerSettingUp) {
+      log('Post-motor: listener dead — running USB reset...', 'qr');
+      await resetUSBDevice();
+      // Health monitor performs the single re-arm once the device returns.
     }
   }, 2000);
 }
@@ -969,7 +968,7 @@ function scheduleQRRecovery() {
 // REJECTION CYCLE  (unchanged)
 // ============================================
 async function executeRejectionCycle() {
-  log('❌ Rejecting item — reversing belt', 'warning');
+  log('Rejecting item — reversing belt', 'warning');
   try {
     await executeCommand('customMotor', CONFIG.motors.belt.reverse);
     await delay(CONFIG.timing.beltReverse);
@@ -1014,7 +1013,7 @@ async function executeAutoCycle() {
     timestamp:         new Date().toISOString()
   };
 
-  log(`⚡ Item #${state.itemsProcessed}: ${cycleData.material} (${cycleData.weight}g) [${cycleData.sessionType}]`, 'success');
+  log(`Item #${state.itemsProcessed}: ${cycleData.material} (${cycleData.weight}g) [${cycleData.sessionType}]`, 'success');
 
   mqttClient.publish(CONFIG.mqtt.topics.cycleComplete, JSON.stringify(cycleData));
 
@@ -1034,7 +1033,6 @@ async function executeAutoCycle() {
     await delay(CONFIG.timing.itemDropDelay);
     resetCompactorIdleTimer();
 
-    // ⚡ Fire stepper home — DON'T wait, overlaps with next detection
     executeCommand('stepperMotor', { position: CONFIG.motors.stepper.positions.home })
       .catch(err => log(`Stepper home error: ${err.message}`, 'error'));
     await delay(200);
@@ -1047,8 +1045,8 @@ async function executeAutoCycle() {
   state.cycleInProgress = false; state.detectionRetries = 0;
   state.awaitingDetection = false; state.itemAlreadyPositioned = false;
 
-  // ✅ After motor cycle, update keyboard activity time
-  // so health monitor doesn't think scanner is dead
+  // After motor cycle, update keyboard activity time so the health monitor's
+  // staleness watchdog doesn't false-trigger.
   state.lastKeyboardActivity = Date.now();
 
   if (state.autoCycleEnabled) await scheduleNextPhotoWithPositioning();
@@ -1058,11 +1056,10 @@ async function executeAutoCycle() {
 // SESSION MANAGEMENT
 // ============================================
 
-// ✅ NEW — Member session (QR validated)
 async function startMemberSession(validationData) {
   state.sessionCount++;
   console.log('\n' + '='.repeat(50));
-  console.log(`🎬 MEMBER SESSION #${state.sessionCount} — ${validationData.user.name}`);
+  console.log(`MEMBER SESSION #${state.sessionCount} — ${validationData.user.name}`);
   console.log('='.repeat(50));
 
   try {
@@ -1105,22 +1102,21 @@ async function startMemberSession(validationData) {
       timestamp: new Date().toISOString()
     }));
 
-    log('⏳ Waiting 4 seconds for first item...', 'info');
+    log('Waiting 4 seconds for first item...', 'info');
     await delay(4000);
     await scheduleNextPhotoWithPositioning();
-    log('✅ Member session active', 'success');
+    log('Member session active', 'success');
 
   } catch (error) {
-    log(`❌ Member session start error: ${error.message}`, 'error');
+    log(`Member session start error: ${error.message}`, 'error');
     await resetSystemForNextUser(true); throw error;
   }
 }
 
-// ✅ Guest session (unchanged from original)
 async function startGuestSession(sessionData) {
   state.sessionCount++;
   console.log('\n' + '='.repeat(50));
-  console.log(`🎬 GUEST SESSION #${state.sessionCount} START`);
+  console.log(`GUEST SESSION #${state.sessionCount} START`);
   console.log('='.repeat(50));
 
   try {
@@ -1157,30 +1153,29 @@ async function startGuestSession(sessionData) {
       timestamp: new Date().toISOString()
     }));
 
-    log('⏳ Waiting 4 seconds for first item...', 'info');
+    log('Waiting 4 seconds for first item...', 'info');
     await delay(4000);
     await scheduleNextPhotoWithPositioning();
-    log('✅ Guest session active', 'success');
+    log('Guest session active', 'success');
 
   } catch (error) {
-    log(`❌ Guest session start error: ${error.message}`, 'error');
+    log(`Guest session start error: ${error.message}`, 'error');
     await resetSystemForNextUser(true); throw error;
   }
 }
 
-// ✅ Reset (unchanged + clears member/qr state)
 async function resetSystemForNextUser(forceStop = false) {
   const resetStartTime = Date.now();
 
   console.log('\n' + '='.repeat(50));
-  console.log(`🔄 RESET AFTER SESSION #${state.sessionCount}`);
+  console.log(`RESET AFTER SESSION #${state.sessionCount}`);
   console.log('='.repeat(50) + '\n');
 
-  log('🚪 Ensuring gate is closed (reset start)...', 'info');
-  try { await executeCommand('closeGate'); await delay(400); log('✅ Gate close confirmed at reset start', 'success'); }
+  log('Ensuring gate is closed (reset start)...', 'info');
+  try { await executeCommand('closeGate'); await delay(400); log('Gate close confirmed at reset start', 'success'); }
   catch (error) { log(`Gate close error (non-fatal): ${error.message}`, 'error'); }
 
-  try { await executeCommand('closeGate'); await delay(300); log('✅ Gate close confirmed (second attempt)', 'success'); }
+  try { await executeCommand('closeGate'); await delay(300); log('Gate close confirmed (second attempt)', 'success'); }
   catch (_) {}
 
   state.resetting = true;
@@ -1203,14 +1198,14 @@ async function resetSystemForNextUser(forceStop = false) {
   finally {
     try {
       if (state.sessionCode && state.itemsProcessed >= 0) {
-        log(`📤 Notifying backend: Session ended (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
+        log(`Notifying backend: Session ended (Code: ${state.sessionCode}, Items: ${state.itemsProcessed})`, 'info');
         mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
           deviceId:       CONFIG.device.id, status: 'session_ended', event: 'session_ended',
           sessionCode:    state.sessionCode, itemsProcessed: state.itemsProcessed,
           sessionType:    state.isMember ? 'member' : 'guest',
           userId:         state.currentUserId, timestamp: new Date().toISOString()
         }));
-        log('✅ Session end notification sent', 'success');
+        log('Session end notification sent', 'success');
         await delay(1500);
       }
     } catch (_) {}
@@ -1230,21 +1225,21 @@ async function resetSystemForNextUser(forceStop = false) {
     state.resetting = false;
     state.isReady   = true;
 
-    // ✅ Re-arm the QR scanner ONCE through the guarded setup path.
-    // setupQRScanner() now: (a) refuses to run if another setup is in flight,
-    // (b) waits for the old WinKeyServer child to fully die before creating a
-    // new one, (c) creates exactly one listener. This is the ONLY place we
-    // re-arm on reset — no proc.close handler and no USB-reset callback also
-    // spawn listeners anymore, so we never stack hooks.
-    //
-    // The expensive Windows PnP USB reset is reserved for the case where the
-    // listener genuinely fails to recover (fallback below), and it runs while
-    // idle so it can't stall a fresh session's belt timing.
-    log('🔄 Re-arming QR scanner (single guarded setup)...', 'qr');
-    setupQRScanner();
+    // ===== v2 CORE FIX =====
+    // Do NOT recreate the listener on reset. A live GlobalKeyboardListener
+    // survives across sessions; recreating it every time is what spawned the
+    // orphan WinKeyServer.exe processes and caused the 7-8 scan ceiling.
+    // Reuse it if alive; re-arm ONCE only if it actually died.
+    if (!state.globalKeyListener && !state.scannerSettingUp) {
+      log('QR listener missing on reset — re-arming once...', 'qr');
+      setupQRScanner();
+    } else {
+      log('QR listener still alive — reusing (no recreate)', 'qr');
+      state.lastKeyboardActivity = Date.now();  // reset staleness window
+    }
 
     console.log('='.repeat(50));
-    console.log('✅ READY FOR NEXT USER');
+    console.log('READY FOR NEXT USER');
     console.log('='.repeat(50) + '\n');
 
     mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
@@ -1257,18 +1252,17 @@ async function resetSystemForNextUser(forceStop = false) {
       message: 'Scan QR or press Start for guest', timestamp: new Date().toISOString()
     }));
 
-    log('✅ System ready for next user', 'success');
-    log(`⏱️ Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
+    log('System ready for next user', 'success');
+    log(`Reset completed in ${Date.now() - resetStartTime}ms`, 'perf');
 
-    // ✅ Fallback recovery: only if the guarded re-arm above did NOT bring the
-    // listener back. This is the ONLY place the heavy PnP USB reset runs, while
-    // idle. It does NOT call setupQRScanner() itself — after the device returns
-    // the health monitor (which sees globalKeyListener === null) re-arms once.
+    // Hardware fallback (KEPT): only if the listener is genuinely dead AND
+    // idle. Guards the real motor-noise USB fault. Does NOT recreate the
+    // listener itself — the health monitor performs the single re-arm once the
+    // device returns. With the v2 reuse logic above, this rarely fires.
     setTimeout(async () => {
       if (state.isReady && !state.autoCycleEnabled && !state.globalKeyListener && !state.scannerSettingUp) {
-        log('💊 Listener did not recover — running full USB reset...', 'qr');
+        log('Listener did not recover — running full USB reset...', 'qr');
         await resetUSBDevice();
-        // No setupQRScanner() here — health monitor handles the single re-arm.
       }
     }, 4000);
   }
@@ -1278,11 +1272,11 @@ async function resetSystemForNextUser(forceStop = false) {
 // SESSION TIMERS  (unchanged)
 // ============================================
 async function handleSessionTimeout(reason) {
-  log(`⏱️ Session timeout: ${reason}`, 'warning');
+  log(`Session timeout: ${reason}`, 'warning');
 
-  log('🚪 Closing gate immediately (timeout)', 'warning');
-  try { await executeCommand('closeGate'); await delay(400); log('✅ Gate closed on timeout', 'success'); }
-  catch (error) { log(`❌ Gate close error: ${error.message}`, 'error'); }
+  log('Closing gate immediately (timeout)', 'warning');
+  try { await executeCommand('closeGate'); await delay(400); log('Gate closed on timeout', 'success'); }
+  catch (error) { log(`Gate close error: ${error.message}`, 'error'); }
   try { await executeCommand('closeGate'); await delay(300); } catch (_) {}
 
   state.autoCycleEnabled = false; state.awaitingDetection = false;
@@ -1335,7 +1329,7 @@ function connectWebSocket() {
   }
 
   state.ws = new WebSocket(CONFIG.local.wsUrl);
-  state.ws.on('open', () => log('✅ WebSocket connected', 'success'));
+  state.ws.on('open', () => log('WebSocket connected', 'success'));
 
   state.ws.on('message', async (data) => {
     try {
@@ -1357,7 +1351,7 @@ function connectWebSocket() {
         mqttClient.publish(CONFIG.mqtt.topics.aiResult, JSON.stringify(state.aiResult));
         if (state.autoCycleEnabled && state.awaitingDetection) {
           state.awaitingDetection = false;
-          log('🔍 AI detection complete — measuring weight...', 'detection');
+          log('AI detection complete — measuring weight...', 'detection');
           setTimeout(() => executeCommand('getWeight'), 100);
         }
         return;
@@ -1375,7 +1369,7 @@ function connectWebSocket() {
         const binInfo = binStatusMap[binCode];
         if (binInfo) {
           if (binInfo.isObjectSensor) return;
-          log(`⚠️ ${binInfo.name} bin full`, 'warning');
+          log(`${binInfo.name} bin full`, 'warning');
           if (binInfo.key) state.binStatus[binInfo.key] = true;
           mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
             deviceId: CONFIG.device.id, binCode, binName: binInfo.name, binKey: binInfo.key,
@@ -1405,7 +1399,7 @@ function connectWebSocket() {
         mqttClient.publish(CONFIG.mqtt.topics.weightResult, JSON.stringify(state.weight));
 
         if (state.aiResult && state.autoCycleEnabled && !state.cycleInProgress) {
-          log(`⚖️ Final weight: ${state.weight.weight}g`, 'info');
+          log(`Final weight: ${state.weight.weight}g`, 'info');
 
           if (state.weight.weight <= 0 && state.calibrationAttempts < 2) {
             state.calibrationAttempts++;
@@ -1418,7 +1412,7 @@ function connectWebSocket() {
           if (state.weight.weight > 0) state.calibrationAttempts = 0;
 
           if (state.weight.weight < CONFIG.detection.minValidWeight) {
-            log('⚠️ Weight too low after photo — skipping', 'warning');
+            log('Weight too low after photo — skipping', 'warning');
             state.aiResult = null; state.weight = null; state.itemAlreadyPositioned = false;
             await scheduleNextPhotoWithPositioning(); return;
           }
@@ -1426,7 +1420,7 @@ function connectWebSocket() {
           if (state.aiResult.materialType === 'UNKNOWN') {
             if (state.detectionRetries < CONFIG.detection.maxRetries) {
               state.detectionRetries++;
-              log(`🔄 Unknown — retry ${state.detectionRetries}/${CONFIG.detection.maxRetries}`, 'warning');
+              log(`Unknown — retry ${state.detectionRetries}/${CONFIG.detection.maxRetries}`, 'warning');
               state.awaitingDetection = true; state.aiResult = null;
               setTimeout(async () => {
                 if (!state.autoCycleEnabled) return;
@@ -1439,11 +1433,11 @@ function connectWebSocket() {
               }, CONFIG.detection.retryDelay);
               return;
             }
-            log(`❌ Unknown after ${state.detectionRetries} retries — rejecting`, 'warning');
+            log(`Unknown after ${state.detectionRetries} retries — rejecting`, 'warning');
             state.cycleInProgress = true; executeRejectionCycle(); return;
           }
 
-          log('✅ Starting auto cycle...', 'success');
+          log('Starting auto cycle...', 'success');
           state.cycleInProgress = true; executeAutoCycle();
         }
         return;
@@ -1457,7 +1451,7 @@ function connectWebSocket() {
 }
 
 // ============================================
-// MQTT  (unchanged + qrInput subscription added)
+// MQTT  (unchanged + qrInput subscription)
 // ============================================
 const mqttClient = mqtt.connect(CONFIG.mqtt.brokerUrl, {
   username:           CONFIG.mqtt.username,
@@ -1467,10 +1461,10 @@ const mqttClient = mqtt.connect(CONFIG.mqtt.brokerUrl, {
 });
 
 mqttClient.on('connect', async () => {
-  log('✅ MQTT connected', 'success');
+  log('MQTT connected', 'success');
 
   mqttClient.subscribe(CONFIG.mqtt.topics.commands);
-  mqttClient.subscribe(CONFIG.mqtt.topics.qrInput);   // ✅ new
+  mqttClient.subscribe(CONFIG.mqtt.topics.qrInput);
   mqttClient.subscribe(CONFIG.mqtt.topics.guestStart);
 
   mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
@@ -1479,7 +1473,7 @@ mqttClient.on('connect', async () => {
   }), { retain: true });
 
   state.isReady = true;
-  log(`✅ System ready — moduleId hardcoded to ${HARDCODED_MODULE_ID}`, 'success');
+  log(`System ready — moduleId hardcoded to ${HARDCODED_MODULE_ID}`, 'success');
 
   mqttClient.publish(CONFIG.mqtt.topics.status, JSON.stringify({
     deviceId: CONFIG.device.id, status: 'ready', event: 'startup_ready',
@@ -1495,17 +1489,17 @@ mqttClient.on('connect', async () => {
     deviceId: CONFIG.device.id, binStatus: state.binStatus, timestamp: new Date().toISOString()
   }), { qos: 1, retain: true });
 
-  log('📤 Initial bin status published', 'info');
+  log('Initial bin status published', 'info');
 
   connectWebSocket();
 
-  // ✅ Sweep any orphan WinKeyServer.exe left by a previous crash/forced close
-  // BEFORE starting our own (manufacturer point 3 — no residual HID consumers).
+  // Sweep any orphan WinKeyServer.exe left by a previous crash/forced close
+  // BEFORE starting our own.
   await killAllKeyServers();
   await delay(300);
 
-  await setupQRScanner();       // ✅ guarded single listener
-  startScannerHealthMonitor();  // ✅ single fallback recovery path
+  await setupQRScanner();       // single permanent listener — created ONCE here
+  startScannerHealthMonitor();  // single fallback recovery path + staleness watchdog
   heartbeat.start();
 });
 
@@ -1513,7 +1507,6 @@ mqttClient.on('message', async (topic, message) => {
   try {
     const payload = JSON.parse(message.toString());
 
-    // Guest session start (unchanged)
     if (topic === CONFIG.mqtt.topics.guestStart) {
       if (state.resetting || !state.isReady) { log('System not ready', 'warning'); return; }
       if (state.autoCycleEnabled) {
@@ -1525,7 +1518,6 @@ mqttClient.on('message', async (topic, message) => {
       return;
     }
 
-    // ✅ QR code via MQTT (fallback — e.g. sent from web dashboard)
     if (topic === CONFIG.mqtt.topics.qrInput) {
       if (canAcceptQRScan()) {
         processQRCode(payload.qrCode).catch(err => log(`QR error: ${err.message}`, 'error'));
@@ -1545,10 +1537,10 @@ mqttClient.on('message', async (topic, message) => {
         const p = payload.params || {};
         if (p.resetAll) {
           state.binStatus = { plastic: false, metal: false, right: false, glass: false };
-          log('✅ All bins reset', 'success');
+          log('All bins reset', 'success');
         } else if (p.binCode !== undefined) {
           const k = { 0:'plastic', 1:'metal', 2:'right', 3:'glass' }[p.binCode];
-          if (k) { state.binStatus[k] = false; log(`✅ ${k} bin reset`, 'success'); }
+          if (k) { state.binStatus[k] = false; log(`${k} bin reset`, 'success'); }
         }
         mqttClient.publish(CONFIG.mqtt.topics.binStatus, JSON.stringify({
           deviceId: CONFIG.device.id, action: 'reset',
@@ -1567,7 +1559,7 @@ mqttClient.on('message', async (topic, message) => {
             binKey: binInfo.key, isFull: true, binStatus: state.binStatus,
             timestamp: new Date().toISOString()
           }), { qos: 1, retain: true });
-          log(`🧪 TEST: ${binInfo.name} bin marked full`, 'warning');
+          log(`TEST: ${binInfo.name} bin marked full`, 'warning');
         }
         return;
       }
@@ -1599,22 +1591,22 @@ mqttClient.on('message', async (topic, message) => {
       }
 
       if (payload.action === 'endSession') {
-        console.log('\n' + '🚨'.repeat(25));
-        console.log('🛑 END SESSION COMMAND RECEIVED');
-        console.log('🚨'.repeat(25) + '\n');
+        console.log('\n' + '='.repeat(50));
+        console.log('END SESSION COMMAND RECEIVED');
+        console.log('='.repeat(50) + '\n');
 
         state.autoCycleEnabled = false; state.awaitingDetection = false;
         if (state.autoPhotoTimer) { clearTimeout(state.autoPhotoTimer); state.autoPhotoTimer = null; }
 
-        log('🚪 IMMEDIATE GATE CLOSE - Attempt 1', 'warning');
-        try { await executeCommand('closeGate'); await delay(400); log('✅ Gate close command 1 sent', 'success'); }
-        catch (error) { log(`❌ Gate close attempt 1 failed: ${error.message}`, 'error'); }
+        log('IMMEDIATE GATE CLOSE - Attempt 1', 'warning');
+        try { await executeCommand('closeGate'); await delay(400); log('Gate close command 1 sent', 'success'); }
+        catch (error) { log(`Gate close attempt 1 failed: ${error.message}`, 'error'); }
 
-        log('🚪 IMMEDIATE GATE CLOSE - Attempt 2 (safety)', 'warning');
-        try { await executeCommand('closeGate'); await delay(400); log('✅ Gate close command 2 sent', 'success'); }
-        catch (error) { log(`❌ Gate close attempt 2 failed: ${error.message}`, 'error'); }
+        log('IMMEDIATE GATE CLOSE - Attempt 2 (safety)', 'warning');
+        try { await executeCommand('closeGate'); await delay(400); log('Gate close command 2 sent', 'success'); }
+        catch (error) { log(`Gate close attempt 2 failed: ${error.message}`, 'error'); }
 
-        console.log('✅ Gate closing commands sent - proceeding with reset\n');
+        console.log('Gate closing commands sent - proceeding with reset\n');
         state.resetting = false;
         await resetSystemForNextUser(false); return;
       }
@@ -1622,7 +1614,7 @@ mqttClient.on('message', async (topic, message) => {
       if (payload.action === 'runDiagnostics') { runDiagnostics(); return; }
 
       if (payload.action === 'restartScanner') {
-        log('🔄 Manual scanner restart requested', 'info');
+        log('Manual scanner restart requested', 'info');
         forceRestartScanner(); return;
       }
 
@@ -1635,7 +1627,7 @@ mqttClient.on('message', async (topic, message) => {
 mqttClient.on('error', (error) => log(`MQTT error: ${error.message}`, 'error'));
 
 // ============================================
-// SHUTDOWN  (✅ now releases hooks + sweeps orphans)
+// SHUTDOWN  (releases hooks + sweeps orphans)
 // ============================================
 let shutdownInProgress = false;
 async function gracefulShutdown() {
@@ -1643,7 +1635,7 @@ async function gracefulShutdown() {
   shutdownInProgress = true;
   state.shuttingDown = true;
 
-  console.log('\n⏹️  Shutting down...\n');
+  console.log('\nShutting down...\n');
   heartbeat.stop();
   if (state.scannerHealthTimer) { clearInterval(state.scannerHealthTimer); state.scannerHealthTimer = null; }
 
@@ -1652,9 +1644,9 @@ async function gracefulShutdown() {
   clearSessionTimers();
   clearQRProcessing();
 
-  // ✅ Manufacturer points 1 & 2: ensure the keyboard hook + raw input handles
-  // are released. Kill the tracked listener, then sweep any orphans so no
-  // WinKeyServer.exe survives with a live SetWindowsHookEx hook.
+  // Ensure the keyboard hook + raw input handles are released. Kill the tracked
+  // listener, then sweep any orphans so no WinKeyServer.exe survives with a
+  // live SetWindowsHookEx hook.
   try { await killListener(); } catch (_) {}
   try { await killAllKeyServers(); } catch (_) {}
 
@@ -1670,12 +1662,10 @@ async function gracefulShutdown() {
 
 process.on('SIGINT',  gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
-process.on('SIGHUP',  gracefulShutdown);   // ✅ console window closed / hangup
+process.on('SIGHUP',  gracefulShutdown);
 process.on('uncaughtException',  (e) => { log(`Uncaught: ${e.message}`, 'error'); console.error(e); gracefulShutdown(); });
 process.on('unhandledRejection', (e) => { log(`Unhandled: ${e && e.message}`, 'error'); console.error(e); });
 
-// ✅ On Windows, surface CTRL+CLOSE / window-close as SIGINT so the hook is
-// unregistered before the process dies (manufacturer point 1).
 if (process.platform === 'win32') {
   try {
     const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
@@ -1687,14 +1677,12 @@ if (process.platform === 'win32') {
 // STARTUP
 // ============================================
 console.log('='.repeat(55));
-console.log('🚀 RVM AGENT — GUEST + MEMBER (QR)');
+console.log('RVM AGENT — GUEST + MEMBER (QR) v2');
 console.log('='.repeat(55));
 console.log(`Device:    ${CONFIG.device.id}`);
 console.log(`Module ID: ${HARDCODED_MODULE_ID} (HARDCODED)`);
-console.log('QR:        ✅ GlobalKeyboardListener (single guarded listener)');
-console.log('Guest:     ✅ press Start button as before');
-console.log('Member:    ✅ scan QR code to start session');
-console.log('Timings:   ⚡ optimized (same as guest-only agent)');
-console.log('Bins:      ✅ retain + qos:1');
-console.log('Scanner:   ✅ kill-and-wait + orphan sweep + hook release on exit');
+console.log('QR:        GlobalKeyboardListener (ONE permanent listener)');
+console.log('Guest:     press Start button as before');
+console.log('Member:    scan QR code to start session');
+console.log('Scanner:   created once + reused across sessions + staleness watchdog');
 console.log('='.repeat(55) + '\n');

@@ -802,7 +802,12 @@ async function executeAutoCycle() {
 
   try {
     // ⚡ Fire-and-forget compactor start - don't await, it's independent
-    startContinuousCompactor().catch(err => log(`Compactor bg error: ${err.message}`, 'error'));
+    if (cycleData.material === 'PLASTIC_BOTTLE') {
+      startContinuousCompactor().catch(err => log(`Compactor bg error: ${err.message}`, 'error'));
+    } else {
+      log('🔨 Skipping compactor (metal can - auto-crushed)', 'crusher');
+    }
+
     
     await executeCommand('customMotor', CONFIG.motors.belt.toStepper);
     await delay(CONFIG.timing.beltToStepper);

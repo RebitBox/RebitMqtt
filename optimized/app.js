@@ -101,9 +101,9 @@ const CONFIG = {
     beltToWeight: 1800,
     beltToStepper: 1800,       // ⚡ was 2200 - same distance as beltToWeight
     beltReverse: 3500,
-    stepperRotate: 2200,
+    stepperRotate: 1500,
     stepperReset: 2200,        // ⚡ was 3000 - same as stepperRotate
-    compactorIdleStop: 10000,
+    compactorIdleStop: 5000,
     positionSettle: 100,       // ⚡ was 200 - belt stops within 100ms
     gateOperation: 600,
     autoPhotoDelay: 2500,

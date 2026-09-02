@@ -76,6 +76,10 @@ const CONFIG = {
       start: { motorId: "04", type: "01" },
       stop: { motorId: "04", type: "00" }
     },
+    // ✅ NEW: one-time can compressor activation, sent once after WebSocket connects
+    canCompressor: {
+      activate: { motorId: "06", type: "03" }
+    },
     stepper: {
       moduleId: '09',
       positions: { home: '01', metalCan: '02', plasticBottle: '03' }
@@ -167,6 +171,9 @@ const state = {
   awaitingDetection: false,
   resetting: false,
   itemAlreadyPositioned: false,
+
+  // ✅ NEW: guards the one-time can compressor activation
+  canCompressorActivated: false,
   
   binStatus: {
     plastic: false,
@@ -341,6 +348,28 @@ async function stopCompactor() {
   if (state.compactorIdleTimer) {
     clearTimeout(state.compactorIdleTimer);
     state.compactorIdleTimer = null;
+  }
+}
+
+// ============================================
+// ONE-TIME CAN COMPRESSOR ACTIVATION
+// ============================================
+// ✅ NEW: fired once, right after the WebSocket connection is established.
+// Guarded by state.canCompressorActivated so it never repeats, even if the
+// WebSocket drops and reconnects later in the process lifetime.
+async function activateCanCompressorOnce() {
+  if (state.canCompressorActivated) {
+    return;
+  }
+
+  try {
+    await executeCommand('customMotor', CONFIG.motors.canCompressor.activate);
+    state.canCompressorActivated = true;
+    log('🔨 Can compressor activated (one-time)', 'crusher');
+  } catch (error) {
+    log(`❌ Can compressor activation failed: ${error.message}`, 'error');
+    // Leave canCompressorActivated as false so it can be retried on the
+    // next WebSocket open if activation failed.
   }
 }
 
@@ -536,6 +565,7 @@ function runDiagnostics() {
   console.log(`   Running: ${state.compactorRunning ? '✅ YES' : '❌ NO'}`);
   console.log(`   Last item: ${state.lastItemTime ? Math.round((Date.now() - state.lastItemTime)/1000) + 's ago' : 'N/A'}`);
   console.log(`   Idle timer: ${state.compactorIdleTimer ? '⏰ ACTIVE' : '❌ NONE'}`);
+  console.log(`   Can compressor activated: ${state.canCompressorActivated ? '✅ YES' : '❌ NO'}`);
   
   console.log('\n🗑️ Bin Status:');
   console.log(`   Plastic (Left): ${state.binStatus.plastic ? '❌ FULL' : '✅ OK'}`);
@@ -1161,6 +1191,13 @@ function connectWebSocket() {
   
   state.ws.on('open', () => {
     log('✅ WebSocket connected', 'success');
+
+    // ✅ NEW: activate the can compressor exactly once after the WebSocket
+    // connection is established. Fire-and-forget so it doesn't block
+    // anything else in the 'open' handler.
+    activateCanCompressorOnce().catch(err =>
+      log(`Can compressor activation error: ${err.message}`, 'error')
+    );
   });
   
   state.ws.on('message', async (data) => {
@@ -1674,6 +1711,7 @@ console.log('Object Sensor: DISABLED (automatic belt movement)');
 console.log('Session timeout: 5 minutes inactivity');
 console.log('✅ Gate closes IMMEDIATELY on session end');
 console.log('✅ Bin status tracking with retain flag');
+console.log('✅ One-time can compressor activation on WebSocket connect');
 console.log('⚡ SPEED OPTIMIZED: ~6.5s/item (was ~11.4s)');
 console.log('   - Stepper reset overlapped with next detection');
 console.log('   - Reduced timing delays across the board');
